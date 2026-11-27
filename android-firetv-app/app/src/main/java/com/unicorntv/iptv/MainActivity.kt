@@ -77,6 +77,7 @@ data class IptvConfig(
     val xtreamUser: String = "",
     val xtreamPass: String = "",
     val epgUrl: String = "",
+    val imdbApiKey: String = "",
     val playIntroOnStart: Boolean = true,
     val maxHeightPx: Int = 720,
     val bufferSeconds: Int = 15,
@@ -93,6 +94,17 @@ data class MediaEntry(
     val streamUrl: String,
     val epgId: String = "",
     val kind: MediaKind = MediaKind.LIVE,
+    val plot: String = ""
+)
+
+data class ImDbMetadata(
+    val imdbId: String = "",
+    val title: String = "",
+    val year: String = "",
+    val rating: String = "",
+    val genre: String = "",
+    val runtime: String = "",
+    val actors: String = "",
     val plot: String = ""
 )
 
@@ -121,6 +133,7 @@ private fun loadConfig(context: Context): IptvConfig {
         xtreamUser = prefs.getString("xtream_user", "") ?: "",
         xtreamPass = prefs.getString("xtream_pass", "") ?: "",
         epgUrl = prefs.getString("epg_url", "") ?: "",
+        imdbApiKey = prefs.getString("imdb_api_key", "") ?: "",
         playIntroOnStart = prefs.getBoolean("play_intro", true),
         maxHeightPx = prefs.getInt("max_height_px", 720),
         bufferSeconds = prefs.getInt("buffer_seconds", 15),
@@ -137,6 +150,7 @@ private fun saveConfig(context: Context, config: IptvConfig) {
         .putString("xtream_user", config.xtreamUser.trim())
         .putString("xtream_pass", config.xtreamPass)
         .putString("epg_url", config.epgUrl.trim())
+        .putString("imdb_api_key", config.imdbApiKey.trim())
         .putBoolean("play_intro", config.playIntroOnStart)
         .putInt("max_height_px", config.maxHeightPx)
         .putInt("buffer_seconds", config.bufferSeconds)
@@ -150,7 +164,7 @@ private fun httpGetText(urlStr: String, timeoutMs: Int = 25000): String {
         connectTimeout = timeoutMs
         readTimeout = timeoutMs
         requestMethod = "GET"
-        setRequestProperty("User-Agent", "TiviMate/4.7.0 (Android)")
+        setRequestProperty("User-Agent", "UnicornTV/2.0 (AndroidTV)")
     }
     return try {
         val code = conn.responseCode
@@ -159,6 +173,53 @@ private fun httpGetText(urlStr: String, timeoutMs: Int = 25000): String {
     } finally {
         conn.disconnect()
     }
+}
+
+private fun cleanTitleAndYear(rawName: String): Pair<String, String?> {
+    val yearMatch = Regex("""\b(19\d{2}|20\d{2})\b""").find(rawName)?.value
+    val cleaned = rawName
+        .replace(Regex("""^\|?[A-Z0-9 /+_-]+\|\s*"""), "")
+        .replace(Regex("""\[[^\]]*\]|\([^)]*\)"""), " ")
+        .replace(
+            Regex("""\b(4K|UHD|FHD|HD|1080p|720p|2160p|HDR|HEVC|x264|x265|WEB-DL|BLURAY)\b""", RegexOption.IGNORE_CASE),
+            " "
+        )
+        .replace(Regex("""\s+"""), " ")
+        .trim()
+    return cleaned to yearMatch
+}
+
+private suspend fun fetchImDbInfo(
+    apiKey: String,
+    rawTitle: String,
+    isSeries: Boolean
+): ImDbMetadata? = withContext(Dispatchers.IO) {
+    val key = apiKey.trim()
+    if (key.isEmpty()) return@withContext null
+
+    val (cleanTitle, year) = cleanTitleAndYear(rawTitle)
+    if (cleanTitle.isBlank()) return@withContext null
+
+    val typeParam = if (isSeries) "series" else "movie"
+    val yearParam = year?.let { "&y=${Uri.encode(it)}" } ?: ""
+    val url = "https://www.omdbapi.com/?apikey=${Uri.encode(key)}&t=${Uri.encode(cleanTitle)}$yearParam&type=$typeParam"
+
+    runCatching {
+        val obj = JSONObject(httpGetText(url, timeoutMs = 10000))
+        if (!obj.optString("Response").equals("True", ignoreCase = true)) {
+            return@runCatching null
+        }
+        ImDbMetadata(
+            imdbId = obj.optString("imdbID", ""),
+            title = obj.optString("Title", cleanTitle),
+            year = obj.optString("Year", year ?: ""),
+            rating = obj.optString("imdbRating", "N/A"),
+            genre = obj.optString("Genre", ""),
+            runtime = obj.optString("Runtime", ""),
+            actors = obj.optString("Actors", ""),
+            plot = obj.optString("Plot", "")
+        )
+    }.getOrNull()
 }
 
 private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withContext(Dispatchers.IO) {
@@ -176,7 +237,6 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
             val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
             val apiBase = "$base/player_api.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
 
-            // 1. Live Categories & Streams
             val liveCatMap = parseCategoryMap(
                 runCatching { httpGetText("$apiBase&action=get_live_categories") }.getOrDefault("[]")
             )
@@ -204,7 +264,6 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
                 )
             }
 
-            // 2. VOD Movies
             val vodCatMap = parseCategoryMap(
                 runCatching { httpGetText("$apiBase&action=get_vod_categories") }.getOrDefault("[]")
             )
@@ -232,7 +291,6 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
                 )
             }
 
-            // 3. Series
             val serCatMap = parseCategoryMap(
                 runCatching { httpGetText("$apiBase&action=get_series_categories") }.getOrDefault("[]")
             )
@@ -259,7 +317,6 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
             }
         }
 
-        // If M3U URL is provided and movies or live streams are still empty, parse M3U too
         if (config.m3uUrl.isNotBlank() && (liveList.isEmpty() || movieList.isEmpty())) {
             val m3uLive = mutableListOf<MediaEntry>()
             val m3uMovies = mutableListOf<MediaEntry>()
@@ -612,6 +669,8 @@ fun UnicornTvApp() {
                 TvSection.MOVIES -> CategorizedBrowserPane(
                     items = catalog.movies,
                     epgNow = emptyMap(),
+                    imdbApiKey = config.imdbApiKey,
+                    isSeries = false,
                     emptyText = "No VOD movies loaded yet. Check Setup or tap Save & Apply to reload VOD.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
                     onSelectEntry = { playingItem = it }
@@ -620,6 +679,8 @@ fun UnicornTvApp() {
                 TvSection.SERIES -> CategorizedBrowserPane(
                     items = catalog.series,
                     epgNow = emptyMap(),
+                    imdbApiKey = config.imdbApiKey,
+                    isSeries = true,
                     emptyText = "No TV series loaded yet. Enter Xtream or M3U details in Setup.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
                     onSelectEntry = { seriesItem ->
@@ -678,6 +739,8 @@ fun UnicornTvApp() {
                 TvSection.FAVORITES -> CategorizedBrowserPane(
                     items = catalog.live.take(25),
                     epgNow = catalog.epgNow,
+                    imdbApiKey = "",
+                    isSeries = false,
                     emptyText = "No channels available yet.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
                     onSelectEntry = { playingItem = it }
@@ -714,7 +777,6 @@ private fun TvGuideWithPreviewPane(
     }
     var selectedCategory by remember(categories) { mutableStateOf(categories.first()) }
 
-    // Keep previewChannel independent of searchQuery so typing in search keeps the preview playing
     var previewChannel by remember(channels) { mutableStateOf(channels.firstOrNull()) }
     var previewError by remember(previewChannel?.streamUrl) { mutableStateOf<String?>(null) }
 
@@ -785,7 +847,6 @@ private fun TvGuideWithPreviewPane(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         modifier = Modifier.fillMaxSize()
     ) {
-        // Left: Categories
         LazyColumn(
             verticalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier
@@ -827,7 +888,6 @@ private fun TvGuideWithPreviewPane(
             }
         }
 
-        // Middle: Search Bar + Channel / EPG Guide List
         Column(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier
@@ -916,7 +976,6 @@ private fun TvGuideWithPreviewPane(
             }
         }
 
-        // Right: Persistent Live Preview Window + Now Playing EPG Info
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
             modifier = Modifier
@@ -1006,6 +1065,8 @@ private fun TvGuideWithPreviewPane(
 private fun CategorizedBrowserPane(
     items: List<MediaEntry>,
     epgNow: Map<String, String>,
+    imdbApiKey: String,
+    isSeries: Boolean,
     emptyText: String,
     onGoToSetup: () -> Unit,
     onSelectEntry: (MediaEntry) -> Unit
@@ -1033,11 +1094,32 @@ private fun CategorizedBrowserPane(
         if (q.isEmpty()) byCat else byCat.filter { it.name.lowercase().contains(q) }
     }
 
+    var focusedEntry by remember(filtered) { mutableStateOf(filtered.firstOrNull()) }
+    val imdbCache = remember { mutableStateMapOf<String, ImDbMetadata?>() }
+    var isLoadingImDb by remember { mutableStateOf(false) }
+
+    LaunchedEffect(focusedEntry?.id, imdbApiKey, isSeries) {
+        val active = focusedEntry ?: return@LaunchedEffect
+        if (imdbApiKey.isBlank()) {
+            isLoadingImDb = false
+            return@LaunchedEffect
+        }
+        val cacheKey = "${if (isSeries) "series" else "movie"}_${active.name}"
+        if (imdbCache.containsKey(cacheKey)) {
+            isLoadingImDb = false
+            return@LaunchedEffect
+        }
+        isLoadingImDb = true
+        val fetched = fetchImDbInfo(imdbApiKey, active.name, isSeries)
+        imdbCache[cacheKey] = fetched
+        isLoadingImDb = false
+    }
+
     Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxSize()) {
         LazyColumn(
             verticalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier
-                .width(230.dp)
+                .width(210.dp)
                 .fillMaxHeight()
         ) {
             items(categories) { cat ->
@@ -1102,14 +1184,22 @@ private fun CategorizedBrowserPane(
                         ),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .onFocusChanged { focused = it.isFocused }
+                            .onFocusChanged { state ->
+                                focused = state.isFocused
+                                if (state.isFocused) {
+                                    focusedEntry = entry
+                                }
+                            }
                             .focusable()
                             .border(
                                 width = if (focused) 2.dp else 1.dp,
                                 color = if (focused) Color(0xFF38BDF8) else Color(0xFF4C1D95),
                                 shape = RoundedCornerShape(10.dp)
                             )
-                            .clickable { onSelectEntry(entry) }
+                            .clickable {
+                                focusedEntry = entry
+                                onSelectEntry(entry)
+                            }
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
                             Text(
@@ -1126,6 +1216,103 @@ private fun CategorizedBrowserPane(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
+                        }
+                    }
+                }
+            }
+        }
+
+        val currentFocused = focusedEntry
+        if (currentFocused != null && imdbApiKey.isNotBlank()) {
+            val cacheKey = "${if (isSeries) "series" else "movie"}_${currentFocused.name}"
+            val meta = imdbCache[cacheKey]
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier
+                    .width(320.dp)
+                    .fillMaxHeight()
+            ) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(14.dp)
+                    ) {
+                        Text(
+                            text = if (isSeries) "IMDb Series Details" else "IMDb Movie Details",
+                            color = Color(0xFF38BDF8),
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                        if (isLoadingImDb) {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            Text(
+                                text = "Looking up ${currentFocused.name}...",
+                                color = Color(0xFFCBD5E1),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        } else if (meta != null) {
+                            Text(
+                                text = "${meta.title} (${meta.year})",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold
+                            )
+                            if (meta.rating.isNotBlank() && meta.rating != "N/A") {
+                                Text(
+                                    text = "IMDb Rating: ★ ${meta.rating}",
+                                    color = Color(0xFF4ADE80),
+                                    fontWeight = FontWeight.SemiBold,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            val specLine = listOf(meta.genre, meta.runtime, meta.imdbId)
+                                .filter { it.isNotBlank() && it != "N/A" }
+                                .joinToString("  •  ")
+                            if (specLine.isNotBlank()) {
+                                Text(
+                                    text = specLine,
+                                    color = Color(0xFF67E8F9),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            if (meta.actors.isNotBlank() && meta.actors != "N/A") {
+                                Text(
+                                    text = "Cast: ${meta.actors}",
+                                    color = Color(0xFFE2E8F0),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            if (meta.plot.isNotBlank() && meta.plot != "N/A") {
+                                Text(
+                                    text = meta.plot,
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 6,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        } else {
+                            Text(
+                                text = currentFocused.name,
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "No matching IMDb entry found for this title.",
+                                color = Color(0xFFCBD5E1),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+
+                        Button(
+                            onClick = { onSelectEntry(currentFocused) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (isSeries) "Play Episode 1" else "Play Movie")
                         }
                     }
                 }
@@ -1774,7 +1961,25 @@ private fun SettingsPane(
     config: IptvConfig,
     onUpdate: (IptvConfig) -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+    var omdbKeyDraft by remember { mutableStateOf(config.imdbApiKey) }
+
+    Column(
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+    ) {
+        TvInputField(
+            value = omdbKeyDraft,
+            onValueChange = { omdbKeyDraft = it },
+            label = "OMDb / IMDb Lookup API Key",
+            imeAction = ImeAction.Done,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Button(onClick = { onUpdate(config.copy(imdbApiKey = omdbKeyDraft)) }) {
+            Text("Save IMDb Lookup Key")
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
