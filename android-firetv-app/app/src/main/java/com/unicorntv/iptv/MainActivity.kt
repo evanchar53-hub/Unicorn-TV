@@ -29,6 +29,11 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
@@ -141,9 +146,17 @@ private enum class TvSection(val title: String, val icon: ImageVector) {
 fun UnicornTvApp() {
     val context = LocalContext.current
     var config by remember { mutableStateOf(loadConfig(context)) }
+    var showIntro by remember { mutableStateOf(config.playIntroOnStart) }
     var selectedSection by remember { mutableStateOf(TvSection.SETUP) }
     var channels by remember { mutableStateOf(buildChannelsFromConfig(config)) }
     var statusMessage by remember { mutableStateOf("") }
+
+    if (showIntro) {
+        IntroVideoOverlay(
+            onFinish = { showIntro = false }
+        )
+        return
+    }
 
     val nebulaBg = Brush.horizontalGradient(
         colors = listOf(Color(0xFF14072B), Color(0xFF280D54), Color(0xFF1A0B38))
@@ -286,6 +299,85 @@ fun UnicornTvApp() {
 }
 
 @Composable
+private fun IntroVideoOverlay(onFinish: () -> Unit) {
+    val context = LocalContext.current
+    val rawResId = remember {
+        context.resources.getIdentifier("unicorn_intro", "raw", context.packageName)
+    }
+
+    val player = remember(rawResId) {
+        if (rawResId == 0) {
+            null
+        } else {
+            try {
+                ExoPlayer.Builder(context).build().apply {
+                    playWhenReady = true
+                    addListener(object : Player.Listener {
+                        override fun onPlaybackStateChanged(playbackState: Int) {
+                            if (playbackState == Player.STATE_ENDED) {
+                                onFinish()
+                            }
+                        }
+
+                        override fun onPlayerError(error: PlaybackException) {
+                            onFinish()
+                        }
+                    })
+                    val uri = Uri.parse("android.resource://${context.packageName}/$rawResId")
+                    setMediaItem(MediaItem.fromUri(uri))
+                    prepare()
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    LaunchedEffect(player) {
+        if (player == null) {
+            onFinish()
+        }
+    }
+
+    DisposableEffect(player) {
+        onDispose {
+            try {
+                player?.stop()
+                player?.release()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    ) {
+        if (player != null) {
+            AndroidView(
+                factory = { ctx ->
+                    PlayerView(ctx).apply {
+                        this.player = player
+                        useController = false
+                    }
+                },
+                update = { view -> view.player = player },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        Button(
+            onClick = onFinish,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(24.dp)
+        ) {
+            Text("Skip Intro")
+        }
+    }
+}
+
+@Composable
 private fun TvInputField(
     value: String,
     onValueChange: (String) -> Unit,
@@ -324,6 +416,16 @@ private fun TvInputField(
                     keyboardController?.show()
                 }
             }
+            .onPreviewKeyEvent { event ->
+                if (
+                    event.type == KeyEventType.KeyDown &&
+                    (event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter)
+                ) {
+                    focusRequester.requestFocus()
+                    keyboardController?.show()
+                }
+                false
+            }
             .border(
                 width = if (focused) 2.dp else 1.dp,
                 color = if (focused) Color(0xFF38BDF8) else Color(0xFF7E22CE),
@@ -339,7 +441,6 @@ private fun SetupAndPlaylistPane(
     statusMessage: String,
     onSave: (IptvConfig) -> Unit
 ) {
-    // Initialized once per composition so typing is never wiped on recompose
     var m3uUrl by remember { mutableStateOf(config.m3uUrl) }
     var xtreamHost by remember { mutableStateOf(config.xtreamHost) }
     var xtreamUser by remember { mutableStateOf(config.xtreamUser) }
