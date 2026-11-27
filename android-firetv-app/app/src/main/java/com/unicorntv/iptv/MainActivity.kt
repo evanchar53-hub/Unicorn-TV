@@ -14,6 +14,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -57,6 +58,7 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -68,23 +70,39 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.UUID
 
-data class IptvConfig(
+data class PlaylistProfile(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "My IPTV Playlist",
     val m3uUrl: String = "",
     val xtreamHost: String = "",
     val xtreamUser: String = "",
     val xtreamPass: String = "",
     val epgUrl: String = "",
+    val updateOnStartup: Boolean = true,
+    val autoDailyUpdate: Boolean = true,
+    val dailyUpdateHour: Int = 4, // 0..23 (default 04:00)
+    val lastUpdatedMs: Long = 0L
+)
+
+data class IptvConfig(
+    val playlists: List<PlaylistProfile> = emptyList(),
+    val activePlaylistId: String = "",
     val imdbApiKey: String = "",
     val playIntroOnStart: Boolean = true,
     val maxHeightPx: Int = 720,
     val bufferSeconds: Int = 15,
     val maxResolutionLabel: String = "1080p",
     val lowLatencyMode: Boolean = false
-)
+) {
+    val activePlaylist: PlaylistProfile?
+        get() = playlists.firstOrNull { it.id == activePlaylistId } ?: playlists.firstOrNull()
+}
 
 enum class MediaKind { LIVE, MOVIE, SERIES }
 
@@ -132,14 +150,91 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun parsePlaylistsJson(raw: String): List<PlaylistProfile> {
+    if (raw.isBlank()) return emptyList()
+    return runCatching {
+        val arr = JSONArray(raw)
+        val out = mutableListOf<PlaylistProfile>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            out.add(
+                PlaylistProfile(
+                    id = o.optString("id").ifBlank { UUID.randomUUID().toString() },
+                    name = o.optString("name", "Playlist ${i + 1}"),
+                    m3uUrl = o.optString("m3uUrl", ""),
+                    xtreamHost = o.optString("xtreamHost", ""),
+                    xtreamUser = o.optString("xtreamUser", ""),
+                    xtreamPass = o.optString("xtreamPass", ""),
+                    epgUrl = o.optString("epgUrl", ""),
+                    updateOnStartup = o.optBoolean("updateOnStartup", true),
+                    autoDailyUpdate = o.optBoolean("autoDailyUpdate", true),
+                    dailyUpdateHour = o.optInt("dailyUpdateHour", 4).coerceIn(0, 23),
+                    lastUpdatedMs = o.optLong("lastUpdatedMs", 0L)
+                )
+            )
+        }
+        out
+    }.getOrDefault(emptyList())
+}
+
+private fun serializePlaylistsJson(list: List<PlaylistProfile>): String {
+    val arr = JSONArray()
+    list.forEach { p ->
+        arr.put(
+            JSONObject().apply {
+                put("id", p.id)
+                put("name", p.name)
+                put("m3uUrl", p.m3uUrl)
+                put("xtreamHost", p.xtreamHost)
+                put("xtreamUser", p.xtreamUser)
+                put("xtreamPass", p.xtreamPass)
+                put("epgUrl", p.epgUrl)
+                put("updateOnStartup", p.updateOnStartup)
+                put("autoDailyUpdate", p.autoDailyUpdate)
+                put("dailyUpdateHour", p.dailyUpdateHour)
+                put("lastUpdatedMs", p.lastUpdatedMs)
+            }
+        )
+    }
+    return arr.toString()
+}
+
 private fun loadConfig(context: Context): IptvConfig {
     val prefs = context.getSharedPreferences("unicorn_tv_prefs", Context.MODE_PRIVATE)
+    var playlists = parsePlaylistsJson(prefs.getString("playlists_json", "") ?: "")
+    var activeId = prefs.getString("active_playlist_id", "") ?: ""
+
+    // Migrate legacy single-playlist fields automatically if present
+    if (playlists.isEmpty()) {
+        val legacyM3u = prefs.getString("m3u_url", "") ?: ""
+        val legacyHost = prefs.getString("xtream_host", "") ?: ""
+        val legacyUser = prefs.getString("xtream_user", "") ?: ""
+        val legacyPass = prefs.getString("xtream_pass", "") ?: ""
+        val legacyEpg = prefs.getString("epg_url", "") ?: ""
+        if (legacyM3u.isNotBlank() || legacyHost.isNotBlank()) {
+            val migrated = PlaylistProfile(
+                name = "Unicorn TV Main",
+                m3uUrl = legacyM3u,
+                xtreamHost = legacyHost,
+                xtreamUser = legacyUser,
+                xtreamPass = legacyPass,
+                epgUrl = legacyEpg,
+                updateOnStartup = true,
+                autoDailyUpdate = true,
+                dailyUpdateHour = 4
+            )
+            playlists = listOf(migrated)
+            activeId = migrated.id
+        }
+    }
+
+    if (activeId.isBlank() && playlists.isNotEmpty()) {
+        activeId = playlists.first().id
+    }
+
     return IptvConfig(
-        m3uUrl = prefs.getString("m3u_url", "") ?: "",
-        xtreamHost = prefs.getString("xtream_host", "") ?: "",
-        xtreamUser = prefs.getString("xtream_user", "") ?: "",
-        xtreamPass = prefs.getString("xtream_pass", "") ?: "",
-        epgUrl = prefs.getString("epg_url", "") ?: "",
+        playlists = playlists,
+        activePlaylistId = activeId,
         imdbApiKey = prefs.getString("imdb_api_key", "") ?: "",
         playIntroOnStart = prefs.getBoolean("play_intro", true),
         maxHeightPx = prefs.getInt("max_height_px", 720),
@@ -152,11 +247,8 @@ private fun loadConfig(context: Context): IptvConfig {
 private fun saveConfig(context: Context, config: IptvConfig) {
     val prefs = context.getSharedPreferences("unicorn_tv_prefs", Context.MODE_PRIVATE)
     prefs.edit()
-        .putString("m3u_url", config.m3uUrl.trim())
-        .putString("xtream_host", config.xtreamHost.trim())
-        .putString("xtream_user", config.xtreamUser.trim())
-        .putString("xtream_pass", config.xtreamPass)
-        .putString("epg_url", config.epgUrl.trim())
+        .putString("playlists_json", serializePlaylistsJson(config.playlists))
+        .putString("active_playlist_id", config.activePlaylistId)
         .putString("imdb_api_key", config.imdbApiKey.trim())
         .putBoolean("play_intro", config.playIntroOnStart)
         .putInt("max_height_px", config.maxHeightPx)
@@ -164,6 +256,22 @@ private fun saveConfig(context: Context, config: IptvConfig) {
         .putString("max_resolution_label", config.maxResolutionLabel)
         .putBoolean("low_latency_mode", config.lowLatencyMode)
         .apply()
+}
+
+private fun isDailyUpdateDue(profile: PlaylistProfile, nowMs: Long = System.currentTimeMillis()): Boolean {
+    if (!profile.autoDailyUpdate) return false
+    val cal = Calendar.getInstance().apply {
+        timeInMillis = nowMs
+        set(Calendar.HOUR_OF_DAY, profile.dailyUpdateHour.coerceIn(0, 23))
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }
+    var scheduledMs = cal.timeInMillis
+    if (scheduledMs > nowMs) {
+        scheduledMs -= 24L * 3600_000L
+    }
+    return profile.lastUpdatedMs < scheduledMs
 }
 
 private fun httpGetText(urlStr: String, connectTimeoutMs: Int = 20000, readTimeoutMs: Int = 90000): String {
@@ -232,8 +340,8 @@ private suspend fun fetchImDbInfo(
     }.getOrNull()
 }
 
-private suspend fun fetchFullCatalog(
-    config: IptvConfig,
+private suspend fun fetchCatalogForPlaylist(
+    playlist: PlaylistProfile,
     onProgress: (String) -> Unit
 ): LoadedCatalog = withContext(Dispatchers.IO) {
     val liveList = mutableListOf<MediaEntry>()
@@ -241,16 +349,16 @@ private suspend fun fetchFullCatalog(
     val seriesList = mutableListOf<MediaEntry>()
     val warnings = mutableListOf<String>()
 
-    val cleanHost = config.xtreamHost.trim().removeSuffix("/")
-    val user = config.xtreamUser.trim()
-    val pass = config.xtreamPass.trim()
+    val cleanHost = playlist.xtreamHost.trim().removeSuffix("/")
+    val user = playlist.xtreamUser.trim()
+    val pass = playlist.xtreamPass.trim()
 
     try {
         if (cleanHost.isNotBlank() && user.isNotBlank() && pass.isNotBlank()) {
             val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
             val apiBase = "$base/player_api.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
 
-            onProgress("Loading Live TV channels...")
+            onProgress("[${playlist.name}] Loading Live TV channels...")
             val liveCatMap = parseCategoryMap(
                 runCatching { httpGetText("$apiBase&action=get_live_categories", readTimeoutMs = 45000) }.getOrDefault("[]")
             )
@@ -276,7 +384,7 @@ private suspend fun fetchFullCatalog(
                 }
             }.onFailure { warnings.add("Live: ${it.message}") }
 
-            onProgress("Loading VOD Movies (large catalog, please wait)...")
+            onProgress("[${playlist.name}] Loading VOD Movies...")
             val vodCatMap = parseCategoryMap(
                 runCatching { httpGetText("$apiBase&action=get_vod_categories", readTimeoutMs = 45000) }.getOrDefault("[]")
             )
@@ -302,7 +410,7 @@ private suspend fun fetchFullCatalog(
                 }
             }.onFailure { warnings.add("VOD: ${it.message}") }
 
-            onProgress("Loading TV Series...")
+            onProgress("[${playlist.name}] Loading TV Series...")
             val serCatMap = parseCategoryMap(
                 runCatching { httpGetText("$apiBase&action=get_series_categories", readTimeoutMs = 45000) }.getOrDefault("[]")
             )
@@ -328,12 +436,12 @@ private suspend fun fetchFullCatalog(
             }.onFailure { warnings.add("Series: ${it.message}") }
         }
 
-        if (config.m3uUrl.isNotBlank() && (liveList.isEmpty() || movieList.isEmpty())) {
-            onProgress("Parsing M3U fallback...")
+        if (playlist.m3uUrl.isNotBlank() && (liveList.isEmpty() || movieList.isEmpty())) {
+            onProgress("[${playlist.name}] Parsing M3U fallback...")
             val m3uLive = mutableListOf<MediaEntry>()
             val m3uMovies = mutableListOf<MediaEntry>()
             val m3uSeries = mutableListOf<MediaEntry>()
-            val rawM3u = httpGetText(config.m3uUrl.trim(), readTimeoutMs = 90000)
+            val rawM3u = httpGetText(playlist.m3uUrl.trim(), readTimeoutMs = 90000)
             parseM3uIntoLists(rawM3u, m3uLive, m3uMovies, m3uSeries)
             if (liveList.isEmpty()) liveList.addAll(m3uLive)
             if (movieList.isEmpty()) movieList.addAll(m3uMovies)
@@ -343,8 +451,8 @@ private suspend fun fetchFullCatalog(
         warnings.add(e.localizedMessage ?: "Failed to load playlist")
     }
 
-    onProgress("Downloading XMLTV EPG guide...")
-    val epgUrl = config.epgUrl.trim().ifBlank {
+    onProgress("[${playlist.name}] Downloading XMLTV EPG guide...")
+    val epgUrl = playlist.epgUrl.trim().ifBlank {
         if (cleanHost.isNotBlank() && user.isNotBlank() && pass.isNotBlank()) {
             val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
             "$base/xmltv.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
@@ -554,33 +662,56 @@ fun UnicornTvApp() {
     var isLoadingCatalog by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
 
-    // Full-screen player entry + currently watching channel persisted when returning to TV Guide
     var fullScreenItem by remember { mutableStateOf<MediaEntry?>(null) }
     var lastWatchedLiveChannel by remember { mutableStateOf<MediaEntry?>(null) }
 
-    fun refreshCatalog(cfg: IptvConfig) {
-        if (cfg.m3uUrl.isBlank() && cfg.xtreamHost.isBlank()) return
+    fun loadPlaylistNow(playlist: PlaylistProfile, currentConfig: IptvConfig = config) {
+        if (playlist.m3uUrl.isBlank() && playlist.xtreamHost.isBlank()) return
         isLoadingCatalog = true
-        statusMessage = "Connecting to server..."
+        statusMessage = "Updating '${playlist.name}'..."
         scope.launch {
-            val loaded = fetchFullCatalog(cfg) { progress ->
+            val loaded = fetchCatalogForPlaylist(playlist) { progress ->
                 statusMessage = progress
             }
             catalog = loaded
             isLoadingCatalog = false
+
+            val nowMs = System.currentTimeMillis()
+            val updatedList = currentConfig.playlists.map { item ->
+                if (item.id == playlist.id) item.copy(lastUpdatedMs = nowMs) else item
+            }
+            val updatedCfg = currentConfig.copy(playlists = updatedList, activePlaylistId = playlist.id)
+            config = updatedCfg
+            saveConfig(context, updatedCfg)
+
             if (lastWatchedLiveChannel == null) {
                 lastWatchedLiveChannel = loaded.live.firstOrNull { !it.name.startsWith("#") } ?: loaded.live.firstOrNull()
             }
             statusMessage = if (loaded.error != null) {
-                "Loaded with notice: ${loaded.error}"
+                "'${playlist.name}' loaded with notice: ${loaded.error}"
             } else {
-                "Loaded ${loaded.live.size} Live, ${loaded.movies.size} Movies, ${loaded.series.size} Series (${loaded.epgTimeline.size} EPG channels)."
+                "'${playlist.name}': ${loaded.live.size} Live, ${loaded.movies.size} Movies, ${loaded.series.size} Series, ${loaded.epgTimeline.size} EPG."
             }
         }
     }
 
+    // Initial startup load (if Update on Startup or Daily Scheduled Update is due)
     LaunchedEffect(Unit) {
-        refreshCatalog(config)
+        val active = config.activePlaylist
+        if (active != null && (active.updateOnStartup || isDailyUpdateDue(active) || active.lastUpdatedMs == 0L)) {
+            loadPlaylistNow(active, config)
+        }
+    }
+
+    // Background scheduler: checks every 60s whether the active playlist's daily scheduled hour has arrived
+    LaunchedEffect(config.activePlaylistId, config.playlists) {
+        while (true) {
+            delay(60_000L)
+            val active = config.activePlaylist
+            if (!isLoadingCatalog && active != null && isDailyUpdateDue(active)) {
+                loadPlaylistNow(active, config)
+            }
+        }
     }
 
     if (showIntro) {
@@ -667,6 +798,7 @@ fun UnicornTvApp() {
                 .weight(1f)
                 .fillMaxHeight()
         ) {
+            val activeName = config.activePlaylist?.name ?: "No Playlist"
             Text(
                 text = "Unicorn TV — ${selectedSection.title}",
                 color = Color.White,
@@ -674,22 +806,52 @@ fun UnicornTvApp() {
                 style = MaterialTheme.typography.headlineSmall
             )
             Text(
-                text = "Live: ${catalog.live.size}  •  Movies: ${catalog.movies.size}  •  Series: ${catalog.series.size}  •  EPG: ${catalog.epgTimeline.size}",
+                text = "Active: $activeName  •  Live: ${catalog.live.size}  •  Movies: ${catalog.movies.size}  •  Series: ${catalog.series.size}  •  EPG: ${catalog.epgTimeline.size}",
                 color = Color(0xFF67E8F9),
                 style = MaterialTheme.typography.bodyMedium
             )
             Spacer(modifier = Modifier.height(10.dp))
 
             when (selectedSection) {
-                TvSection.SETUP -> SetupAndPlaylistPane(
+                TvSection.SETUP -> SetupAndPlaylistsPane(
                     config = config,
                     catalog = catalog,
                     isLoading = isLoadingCatalog,
                     statusMessage = statusMessage,
-                    onSave = { updated ->
-                        config = updated
-                        saveConfig(context, updated)
-                        refreshCatalog(updated)
+                    onSavePlaylist = { profile, makeActive ->
+                        val exists = config.playlists.any { it.id == profile.id }
+                        val updatedList = if (exists) {
+                            config.playlists.map { if (it.id == profile.id) profile else it }
+                        } else {
+                            config.playlists + profile
+                        }
+                        val targetActiveId = if (makeActive || config.activePlaylistId.isBlank()) profile.id else config.activePlaylistId
+                        val updatedCfg = config.copy(playlists = updatedList, activePlaylistId = targetActiveId)
+                        config = updatedCfg
+                        saveConfig(context, updatedCfg)
+                        if (targetActiveId == profile.id) {
+                            lastWatchedLiveChannel = null
+                            loadPlaylistNow(profile, updatedCfg)
+                        } else {
+                            statusMessage = "Saved playlist '${profile.name}'."
+                        }
+                    },
+                    onActivatePlaylist = { profile ->
+                        lastWatchedLiveChannel = null
+                        loadPlaylistNow(profile, config)
+                    },
+                    onDeletePlaylist = { profile ->
+                        val remaining = config.playlists.filterNot { it.id == profile.id }
+                        val nextActive = if (config.activePlaylistId == profile.id) {
+                            remaining.firstOrNull()?.id.orEmpty()
+                        } else {
+                            config.activePlaylistId
+                        }
+                        val updatedCfg = config.copy(playlists = remaining, activePlaylistId = nextActive)
+                        config = updatedCfg
+                        saveConfig(context, updatedCfg)
+                        statusMessage = "Removed playlist '${profile.name}'."
+                        updatedCfg.activePlaylist?.let { loadPlaylistNow(it, updatedCfg) }
                     }
                 )
 
@@ -710,7 +872,7 @@ fun UnicornTvApp() {
                     items = catalog.movies,
                     imdbApiKey = config.imdbApiKey,
                     isSeries = false,
-                    emptyText = "No VOD movies loaded yet. Check Setup or tap Save & Apply to reload VOD.",
+                    emptyText = "No VOD movies loaded yet. Check Setup or update your active playlist.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
                     onSelectEntry = { fullScreenItem = it }
                 )
@@ -719,7 +881,7 @@ fun UnicornTvApp() {
                     items = catalog.series,
                     imdbApiKey = config.imdbApiKey,
                     isSeries = true,
-                    emptyText = "No TV series loaded yet. Enter Xtream or M3U details in Setup.",
+                    emptyText = "No TV series loaded yet. Add a playlist in Setup.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
                     onSelectEntry = { seriesItem ->
                         scope.launch {
@@ -791,6 +953,334 @@ fun UnicornTvApp() {
 }
 
 @Composable
+private fun SetupAndPlaylistsPane(
+    config: IptvConfig,
+    catalog: LoadedCatalog,
+    isLoading: Boolean,
+    statusMessage: String,
+    onSavePlaylist: (PlaylistProfile, makeActive: Boolean) -> Unit,
+    onActivatePlaylist: (PlaylistProfile) -> Unit,
+    onDeletePlaylist: (PlaylistProfile) -> Unit
+) {
+    val initialProfile = config.activePlaylist ?: PlaylistProfile(name = "Unicorn TV Main")
+    var editingId by remember { mutableStateOf(initialProfile.id) }
+    var playlistName by remember { mutableStateOf(initialProfile.name) }
+    var m3uUrl by remember { mutableStateOf(initialProfile.m3uUrl) }
+    var xtreamHost by remember { mutableStateOf(initialProfile.xtreamHost) }
+    var xtreamUser by remember { mutableStateOf(initialProfile.xtreamUser) }
+    var xtreamPass by remember { mutableStateOf(initialProfile.xtreamPass) }
+    var epgUrl by remember { mutableStateOf(initialProfile.epgUrl) }
+    var updateOnStartup by remember { mutableStateOf(initialProfile.updateOnStartup) }
+    var autoDailyUpdate by remember { mutableStateOf(initialProfile.autoDailyUpdate) }
+    var dailyUpdateHour by remember { mutableStateOf(initialProfile.dailyUpdateHour) }
+
+    fun loadIntoEditor(p: PlaylistProfile) {
+        editingId = p.id
+        playlistName = p.name
+        m3uUrl = p.m3uUrl
+        xtreamHost = p.xtreamHost
+        xtreamUser = p.xtreamUser
+        xtreamPass = p.xtreamPass
+        epgUrl = p.epgUrl
+        updateOnStartup = p.updateOnStartup
+        autoDailyUpdate = p.autoDailyUpdate
+        dailyUpdateHour = p.dailyUpdateHour
+    }
+
+    val dateFmt = remember { SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()) }
+
+    Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxSize()) {
+        // Left Column: Saved Playlists List + "+ Add New Playlist" button
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
+            modifier = Modifier
+                .width(275.dp)
+                .fillMaxHeight()
+        ) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(12.dp)
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Saved Playlists (${config.playlists.size})",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Button(
+                        onClick = {
+                            loadIntoEditor(
+                                PlaylistProfile(
+                                    name = "Playlist ${config.playlists.size + 1}",
+                                    updateOnStartup = true,
+                                    autoDailyUpdate = true,
+                                    dailyUpdateHour = 4
+                                )
+                            )
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text("+ New")
+                    }
+                }
+
+                if (config.playlists.isEmpty()) {
+                    Text(
+                        text = "No saved playlists yet. Fill out the form on the right and click Save & Load.",
+                        color = Color(0xFFCBD5E1),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                } else {
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        items(config.playlists) { item ->
+                            val isActive = item.id == config.activePlaylistId
+                            val isEditing = item.id == editingId
+                            Card(
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isActive) Color(0xFF3B1976) else Color(0xFF24104A)
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(
+                                        width = if (isEditing || isActive) 2.dp else 1.dp,
+                                        color = if (isActive) Color(0xFF4ADE80) else if (isEditing) Color(0xFF38BDF8) else Color(0xFF4C1D95),
+                                        shape = RoundedCornerShape(10.dp)
+                                    )
+                            ) {
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.padding(10.dp)
+                                ) {
+                                    Text(
+                                        text = "${if (isActive) "✓ " else ""}${item.name}",
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    val schedText = buildString {
+                                        if (item.updateOnStartup) append("Startup")
+                                        if (item.autoDailyUpdate) {
+                                            if (isNotEmpty()) append(" + ")
+                                            append("Daily ${"%02d:00".format(item.dailyUpdateHour)}")
+                                        }
+                                        if (isEmpty()) append("Manual update")
+                                    }
+                                    Text(
+                                        text = "Auto: $schedText",
+                                        color = Color(0xFF67E8F9),
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    Text(
+                                        text = if (item.lastUpdatedMs > 0L) {
+                                            "Updated: ${dateFmt.format(Date(item.lastUpdatedMs))}"
+                                        } else {
+                                            "Not synced yet"
+                                        },
+                                        color = Color(0xFFCBD5E1),
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Button(
+                                            enabled = !isLoading,
+                                            onClick = {
+                                                loadIntoEditor(item)
+                                                onActivatePlaylist(item)
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            Text(if (isActive) "Sync" else "Use", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                        Button(
+                                            onClick = { loadIntoEditor(item) },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            Text("Edit", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                        Button(
+                                            onClick = { onDeletePlaylist(item) },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7F1D1D)),
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            Text("Del", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Right Column: Playlist Form + Auto-Update Schedule
+        Column(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState())
+        ) {
+            TvInputField(
+                value = playlistName,
+                onValueChange = { playlistName = it },
+                label = "Playlist Name (e.g., Main IPTV, Sports Backup)",
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            TvInputField(
+                value = m3uUrl,
+                onValueChange = { m3uUrl = it },
+                label = "M3U / M3U8 Playlist URL (Optional if using Xtream)",
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                TvInputField(
+                    value = xtreamHost,
+                    onValueChange = { xtreamHost = it },
+                    label = "Xtream Server URL",
+                    modifier = Modifier.weight(1f)
+                )
+                TvInputField(
+                    value = xtreamUser,
+                    onValueChange = { xtreamUser = it },
+                    label = "Username",
+                    modifier = Modifier.weight(1f)
+                )
+                TvInputField(
+                    value = xtreamPass,
+                    onValueChange = { xtreamPass = it },
+                    label = "Password",
+                    isPassword = true,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            TvInputField(
+                value = epgUrl,
+                onValueChange = { epgUrl = it },
+                label = "EPG (XMLTV) URL",
+                imeAction = ImeAction.Done,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            // Auto-Update Schedule Card
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.padding(12.dp)
+                ) {
+                    Text(
+                        text = "Automatic Playlist & EPG Update Schedule",
+                        color = Color(0xFF38BDF8),
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleSmall
+                    )
+
+                    Row(
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Update automatically on each app startup", color = Color.White)
+                        Switch(
+                            checked = updateOnStartup,
+                            onCheckedChange = { updateOnStartup = it }
+                        )
+                    }
+
+                    Row(
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Update automatically once every day", color = Color.White)
+                        Switch(
+                            checked = autoDailyUpdate,
+                            onCheckedChange = { autoDailyUpdate = it }
+                        )
+                    }
+
+                    if (autoDailyUpdate) {
+                        Text(
+                            text = "Select Daily Update Time: ${"%02d:00".format(dailyUpdateHour)}",
+                            color = Color(0xFF67E8F9),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            items((0..23).toList()) { hour ->
+                                val selected = dailyUpdateHour == hour
+                                Button(
+                                    onClick = { dailyUpdateHour = hour },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (selected) Color(0xFFD946EF) else Color(0xFF3B1976)
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                ) {
+                                    Text("${"%02d:00".format(hour)}", style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(
+                    enabled = !isLoading,
+                    onClick = {
+                        val existing = config.playlists.firstOrNull { it.id == editingId }
+                        val profile = PlaylistProfile(
+                            id = editingId,
+                            name = playlistName.trim().ifBlank { "My IPTV Playlist" },
+                            m3uUrl = m3uUrl.trim(),
+                            xtreamHost = xtreamHost.trim(),
+                            xtreamUser = xtreamUser.trim(),
+                            xtreamPass = xtreamPass,
+                            epgUrl = epgUrl.trim(),
+                            updateOnStartup = updateOnStartup,
+                            autoDailyUpdate = autoDailyUpdate,
+                            dailyUpdateHour = dailyUpdateHour,
+                            lastUpdatedMs = existing?.lastUpdatedMs ?: 0L
+                        )
+                        onSavePlaylist(profile, true)
+                    }
+                ) {
+                    Text(if (isLoading) "Updating Playlist..." else "Save & Load Playlist")
+                }
+
+                if (statusMessage.isNotBlank()) {
+                    Text(statusMessage, color = Color(0xFF4ADE80), modifier = Modifier.weight(1f))
+                }
+            }
+
+            if (isLoading) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+
+            Text(
+                text = "Loaded Catalog: ${catalog.live.size} Live • ${catalog.movies.size} Movies • ${catalog.series.size} Series • ${catalog.epgTimeline.size} EPG Channels",
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+
+@Composable
 private fun RealTvGuidePane(
     channels: List<MediaEntry>,
     epgTimeline: Map<String, List<EpgSlot>>,
@@ -802,7 +1292,7 @@ private fun RealTvGuidePane(
 ) {
     if (channels.isEmpty()) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("No live channels loaded yet. Enter Xtream or M3U details in Setup.", color = Color(0xFFFBBF24))
+            Text("No live channels loaded yet. Add or sync a playlist in Setup.", color = Color(0xFFFBBF24))
             Button(onClick = onGoToSetup) {
                 Text("Go to IPTV & EPG Setup")
             }
@@ -882,7 +1372,6 @@ private fun RealTvGuidePane(
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxSize()) {
-        // Top Header: Live Video Preview Window + Search Bar (stays playing while typing in Search)
         Row(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier
@@ -991,7 +1480,6 @@ private fun RealTvGuidePane(
             }
         }
 
-        // Bottom: TiviMate-style Categories + Time-Slot EPG Grid
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.weight(1f)) {
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -1035,7 +1523,6 @@ private fun RealTvGuidePane(
             }
 
             Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                // Time-Slot Header Bar
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1149,7 +1636,6 @@ private fun CustomizableMultiViewPane(
     var pickingSlotIndex by remember { mutableStateOf<Int?>(null) }
     val tileErrors = remember { mutableStateMapOf<Int, String>() }
 
-    // Channel Picker Dialog for an individual square
     val targetSlot = pickingSlotIndex
     if (targetSlot != null) {
         var pickerQuery by remember { mutableStateOf("") }
@@ -1266,7 +1752,6 @@ private fun CustomizableMultiViewPane(
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
-        // Screen Count Selector (2, 3, or 4 Screens)
         Row(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -1295,7 +1780,6 @@ private fun CustomizableMultiViewPane(
             )
         }
 
-        // Dynamic Grid for 2, 3, or 4 Screens
         val rows: List<List<Int>> = when (screenCount) {
             2 -> listOf(listOf(0, 1))
             3 -> listOf(listOf(0, 1), listOf(2))
@@ -1346,7 +1830,6 @@ private fun CustomizableMultiViewPane(
                             )
                         }
 
-                        // Top overlay bar per square: Channel name + Pick Channel button
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -1852,98 +2335,6 @@ private fun TvInputField(
                 shape = RoundedCornerShape(4.dp)
             )
     )
-}
-
-@Composable
-private fun SetupAndPlaylistPane(
-    config: IptvConfig,
-    catalog: LoadedCatalog,
-    isLoading: Boolean,
-    statusMessage: String,
-    onSave: (IptvConfig) -> Unit
-) {
-    var m3uUrl by remember { mutableStateOf(config.m3uUrl) }
-    var xtreamHost by remember { mutableStateOf(config.xtreamHost) }
-    var xtreamUser by remember { mutableStateOf(config.xtreamUser) }
-    var xtreamPass by remember { mutableStateOf(config.xtreamPass) }
-    var epgUrl by remember { mutableStateOf(config.epgUrl) }
-
-    Column(
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-    ) {
-        TvInputField(
-            value = m3uUrl,
-            onValueChange = { m3uUrl = it },
-            label = "M3U / M3U8 Playlist URL (Optional if using Xtream)",
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-            TvInputField(
-                value = xtreamHost,
-                onValueChange = { xtreamHost = it },
-                label = "Xtream Server URL",
-                modifier = Modifier.weight(1f)
-            )
-            TvInputField(
-                value = xtreamUser,
-                onValueChange = { xtreamUser = it },
-                label = "Username",
-                modifier = Modifier.weight(1f)
-            )
-            TvInputField(
-                value = xtreamPass,
-                onValueChange = { xtreamPass = it },
-                label = "Password",
-                isPassword = true,
-                modifier = Modifier.weight(1f)
-            )
-        }
-
-        TvInputField(
-            value = epgUrl,
-            onValueChange = { epgUrl = it },
-            label = "EPG (XMLTV) URL",
-            imeAction = ImeAction.Done,
-            modifier = Modifier.fillMaxWidth()
-        )
-
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-            Button(
-                enabled = !isLoading,
-                onClick = {
-                    onSave(
-                        config.copy(
-                            m3uUrl = m3uUrl,
-                            xtreamHost = xtreamHost,
-                            xtreamUser = xtreamUser,
-                            xtreamPass = xtreamPass,
-                            epgUrl = epgUrl
-                        )
-                    )
-                }
-            ) {
-                Text(if (isLoading) "Loading Catalog..." else "Save & Apply IPTV / EPG")
-            }
-            if (statusMessage.isNotBlank()) {
-                Text(statusMessage, color = Color(0xFF4ADE80), modifier = Modifier.weight(1f))
-            }
-        }
-
-        if (isLoading) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        }
-
-        Text(
-            text = "Summary: ${catalog.live.size} Live Channels, ${catalog.movies.size} Movies, ${catalog.series.size} Series, ${catalog.epgTimeline.size} EPG Channels",
-            color = Color.White,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.padding(top = 6.dp)
-        )
-    }
 }
 
 @Composable
