@@ -12,28 +12,41 @@ import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.net.HttpURLConnection
+import java.net.URL
 
 data class IptvConfig(
     val m3uUrl: String = "",
@@ -42,7 +55,10 @@ data class IptvConfig(
     val xtreamPass: String = "",
     val epgUrl: String = "",
     val playIntroOnStart: Boolean = true,
-    val maxHeightPx: Int = 720
+    val maxHeightPx: Int = 720,
+    val bufferSeconds: Int = 15,
+    val maxResolutionLabel: String = "1080p",
+    val lowLatencyMode: Boolean = false
 )
 
 data class ChannelItem(
@@ -69,7 +85,10 @@ private fun loadConfig(context: Context): IptvConfig {
         xtreamPass = prefs.getString("xtream_pass", "") ?: "",
         epgUrl = prefs.getString("epg_url", "") ?: "",
         playIntroOnStart = prefs.getBoolean("play_intro", true),
-        maxHeightPx = prefs.getInt("max_height_px", 720)
+        maxHeightPx = prefs.getInt("max_height_px", 720),
+        bufferSeconds = prefs.getInt("buffer_seconds", 15),
+        maxResolutionLabel = prefs.getString("max_resolution_label", "1080p") ?: "1080p",
+        lowLatencyMode = prefs.getBoolean("low_latency_mode", false)
     )
 }
 
@@ -83,6 +102,9 @@ private fun saveConfig(context: Context, config: IptvConfig) {
         .putString("epg_url", config.epgUrl.trim())
         .putBoolean("play_intro", config.playIntroOnStart)
         .putInt("max_height_px", config.maxHeightPx)
+        .putInt("buffer_seconds", config.bufferSeconds)
+        .putString("max_resolution_label", config.maxResolutionLabel)
+        .putBoolean("low_latency_mode", config.lowLatencyMode)
         .apply()
 }
 
@@ -111,7 +133,7 @@ private enum class TvSection(val title: String, val icon: ImageVector) {
     MULTIVIEW("Multi-View (4x)", Icons.Default.GridView),
     MOVIES("Movies (VOD)", Icons.Default.Movie),
     SERIES("Series", Icons.Default.Tv),
-    SEARCH("Search", Icons.Default.Search),
+    SPEED_OPTIMIZER("Speed Optimizer", Icons.Default.Speed),
     SETTINGS("Settings", Icons.Default.Settings)
 }
 
@@ -133,7 +155,7 @@ fun UnicornTvApp() {
             .background(nebulaBg)
             .padding(16.dp)
     ) {
-        // Left D-Pad Friendly Rail
+        // Left D-Pad Friendly Rail (8 sections)
         Column(
             modifier = Modifier
                 .width(76.dp)
@@ -220,6 +242,28 @@ fun UnicornTvApp() {
                     onGoToSetup = { selectedSection = TvSection.SETUP }
                 )
 
+                TvSection.SPEED_OPTIMIZER -> SpeedOptimizerPane(
+                    bufferSeconds = config.bufferSeconds,
+                    maxResolutionLabel = config.maxResolutionLabel,
+                    lowLatencyMode = config.lowLatencyMode,
+                    onApplySettings = { bufferSec, resLabel, lowLat ->
+                        val heightPx = when (resLabel) {
+                            "720p" -> 720
+                            "4K" -> 2160
+                            else -> 1080
+                        }
+                        val updated = config.copy(
+                            bufferSeconds = bufferSec,
+                            maxResolutionLabel = resLabel,
+                            lowLatencyMode = lowLat,
+                            maxHeightPx = heightPx
+                        )
+                        config = updated
+                        saveConfig(context, updated)
+                        statusMessage = "Applied ${bufferSec}s buffer & $resLabel cap."
+                    }
+                )
+
                 TvSection.SETTINGS -> SettingsPane(
                     config = config,
                     onUpdate = { updated ->
@@ -242,97 +286,141 @@ fun UnicornTvApp() {
 }
 
 @Composable
+private fun TvInputField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    isPassword: Boolean = false,
+    imeAction: ImeAction = ImeAction.Next,
+    modifier: Modifier = Modifier
+) {
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var focused by remember { mutableStateOf(false) }
+
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        singleLine = true,
+        visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
+        keyboardOptions = KeyboardOptions(imeAction = imeAction),
+        keyboardActions = KeyboardActions(
+            onDone = { keyboardController?.hide() }
+        ),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedTextColor = Color.White,
+            unfocusedTextColor = Color.White,
+            focusedLabelColor = Color(0xFF38BDF8),
+            unfocusedLabelColor = Color(0xFFCBD5E1),
+            focusedContainerColor = Color(0xFF1F0C40),
+            unfocusedContainerColor = Color(0xFF180933)
+        ),
+        modifier = modifier
+            .focusRequester(focusRequester)
+            .onFocusChanged { state ->
+                focused = state.isFocused
+                if (state.isFocused) {
+                    keyboardController?.show()
+                }
+            }
+            .border(
+                width = if (focused) 2.dp else 1.dp,
+                color = if (focused) Color(0xFF38BDF8) else Color(0xFF7E22CE),
+                shape = RoundedCornerShape(4.dp)
+            )
+            .clickable {
+                focusRequester.requestFocus()
+                keyboardController?.show()
+            }
+    )
+}
+
+@Composable
 private fun SetupAndPlaylistPane(
     config: IptvConfig,
     channels: List<ChannelItem>,
     statusMessage: String,
     onSave: (IptvConfig) -> Unit
 ) {
-    var m3uUrl by remember(config) { mutableStateOf(config.m3uUrl) }
-    var xtreamHost by remember(config) { mutableStateOf(config.xtreamHost) }
-    var xtreamUser by remember(config) { mutableStateOf(config.xtreamUser) }
-    var xtreamPass by remember(config) { mutableStateOf(config.xtreamPass) }
-    var epgUrl by remember(config) { mutableStateOf(config.epgUrl) }
+    // Initialized once per composition so typing is never wiped on recompose
+    var m3uUrl by remember { mutableStateOf(config.m3uUrl) }
+    var xtreamHost by remember { mutableStateOf(config.xtreamHost) }
+    var xtreamUser by remember { mutableStateOf(config.xtreamUser) }
+    var xtreamPass by remember { mutableStateOf(config.xtreamPass) }
+    var epgUrl by remember { mutableStateOf(config.epgUrl) }
 
-    LazyColumn(
+    Column(
         verticalArrangement = Arrangement.spacedBy(10.dp),
-        modifier = Modifier.fillMaxSize()
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
     ) {
-        item {
-            OutlinedTextField(
-                value = m3uUrl,
-                onValueChange = { m3uUrl = it },
-                label = { Text("M3U / M3U8 Playlist URL") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
+        TvInputField(
+            value = m3uUrl,
+            onValueChange = { m3uUrl = it },
+            label = "M3U / M3U8 Playlist URL",
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            TvInputField(
+                value = xtreamHost,
+                onValueChange = { xtreamHost = it },
+                label = "Xtream Server URL",
+                modifier = Modifier.weight(1f)
+            )
+            TvInputField(
+                value = xtreamUser,
+                onValueChange = { xtreamUser = it },
+                label = "Username",
+                modifier = Modifier.weight(1f)
+            )
+            TvInputField(
+                value = xtreamPass,
+                onValueChange = { xtreamPass = it },
+                label = "Password",
+                isPassword = true,
+                modifier = Modifier.weight(1f)
             )
         }
-        item {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                OutlinedTextField(
-                    value = xtreamHost,
-                    onValueChange = { xtreamHost = it },
-                    label = { Text("Xtream Server URL") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedTextField(
-                    value = xtreamUser,
-                    onValueChange = { xtreamUser = it },
-                    label = { Text("Username") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedTextField(
-                    value = xtreamPass,
-                    onValueChange = { xtreamPass = it },
-                    label = { Text("Password") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
-        item {
-            OutlinedTextField(
-                value = epgUrl,
-                onValueChange = { epgUrl = it },
-                label = { Text("EPG (XMLTV) URL") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-        item {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                Button(
-                    onClick = {
-                        onSave(
-                            config.copy(
-                                m3uUrl = m3uUrl,
-                                xtreamHost = xtreamHost,
-                                xtreamUser = xtreamUser,
-                                xtreamPass = xtreamPass,
-                                epgUrl = epgUrl
-                            )
+
+        TvInputField(
+            value = epgUrl,
+            onValueChange = { epgUrl = it },
+            label = "EPG (XMLTV) URL",
+            imeAction = ImeAction.Done,
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+            Button(
+                onClick = {
+                    onSave(
+                        config.copy(
+                            m3uUrl = m3uUrl,
+                            xtreamHost = xtreamHost,
+                            xtreamUser = xtreamUser,
+                            xtreamPass = xtreamPass,
+                            epgUrl = epgUrl
                         )
-                    }
-                ) {
-                    Text("Save & Apply IPTV / EPG")
+                    )
                 }
-                if (statusMessage.isNotBlank()) {
-                    Text(statusMessage, color = Color(0xFF4ADE80))
-                }
+            ) {
+                Text("Save & Apply IPTV / EPG")
+            }
+            if (statusMessage.isNotBlank()) {
+                Text(statusMessage, color = Color(0xFF4ADE80))
             }
         }
-        item {
-            Text(
-                text = "Configured Streams (${channels.size}):",
-                color = Color.White,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(top = 6.dp)
-            )
-        }
-        items(channels) { ch ->
+
+        Text(
+            text = "Configured Streams (${channels.size}):",
+            color = Color.White,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(top = 6.dp)
+        )
+        channels.forEach { ch ->
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
                 modifier = Modifier.fillMaxWidth()
@@ -508,6 +596,210 @@ private fun SafeMultiViewPane(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SpeedOptimizerPane(
+    bufferSeconds: Int,
+    maxResolutionLabel: String,
+    lowLatencyMode: Boolean,
+    onApplySettings: (bufferSec: Int, resolutionLabel: String, lowLatency: Boolean) -> Unit
+) {
+    val coroutineScope = rememberCoroutineScope()
+    var isTesting by remember { mutableStateOf(false) }
+    var measuredMbps by remember { mutableStateOf<Float?>(null) }
+    var pingMs by remember { mutableStateOf<Int?>(null) }
+    var statusText by remember { mutableStateOf("Run a quick network check or tune playback buffers for your Fire TV connection.") }
+
+    var selectedBuffer by remember { mutableStateOf(bufferSeconds) }
+    var selectedRes by remember { mutableStateOf(maxResolutionLabel) }
+    var selectedLowLatency by remember { mutableStateOf(lowLatencyMode) }
+
+    val recommendation = when {
+        measuredMbps == null -> "Recommended: 15s buffer + 1080p until speed test runs."
+        measuredMbps!! >= 45f -> "Recommended: 4K60 HDR supported (10s–15s buffer)."
+        measuredMbps!! >= 18f -> "Recommended: 1080p60 smooth (15s–25s buffer) for steady IPTV playback."
+        else -> "Recommended: 720p cap + 25s–40s buffer to prevent buffering on slower links."
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Connection & Throughput Check",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Button(
+                        enabled = !isTesting,
+                        onClick = {
+                            isTesting = true
+                            statusText = "Testing download throughput..."
+                            coroutineScope.launch(Dispatchers.IO) {
+                                val result = measureDownloadSpeedMbps()
+                                withContext(Dispatchers.Main) {
+                                    isTesting = false
+                                    if (result != null) {
+                                        measuredMbps = result.first
+                                        pingMs = result.second
+                                        statusText = "Measured ${"%.1f".format(result.first)} Mbps (${result.second} ms)"
+                                    } else {
+                                        statusText = "Could not reach speed test endpoint. Check network/VPN and try again."
+                                    }
+                                }
+                            }
+                        }
+                    ) {
+                        Text(if (isTesting) "Testing..." else "Run Speed Test")
+                    }
+                }
+
+                if (isTesting) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                    Text(
+                        text = "Download: ${measuredMbps?.let { "%.1f Mbps".format(it) } ?: "--"}",
+                        color = Color(0xFF67E8F9),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Latency: ${pingMs?.let { "$it ms" } ?: "--"}",
+                        color = Color(0xFF67E8F9),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                Text(text = statusText, color = Color(0xFFE2E8F0), style = MaterialTheme.typography.bodyMedium)
+                Text(text = recommendation, color = Color(0xFF4ADE80), style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "Stream Buffer & Resolution Cap",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleMedium
+                )
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Buffer:", color = Color.White, modifier = Modifier.width(90.dp))
+                    listOf(5, 15, 25, 40).forEach { sec ->
+                        val active = selectedBuffer == sec
+                        Button(
+                            onClick = { selectedBuffer = sec },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (active) Color(0xFFD946EF) else Color(0xFF3B1976)
+                            )
+                        ) {
+                            Text("${sec}s")
+                        }
+                    }
+                }
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Max Res:", color = Color.White, modifier = Modifier.width(90.dp))
+                    listOf("720p", "1080p", "4K").forEach { res ->
+                        val active = selectedRes == res
+                        Button(
+                            onClick = { selectedRes = res },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (active) Color(0xFFD946EF) else Color(0xFF3B1976)
+                            )
+                        ) {
+                            Text(res)
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Low-Latency Live Mode", color = Color.White)
+                    Switch(
+                        checked = selectedLowLatency,
+                        onCheckedChange = { selectedLowLatency = it }
+                    )
+                }
+
+                Button(
+                    onClick = {
+                        onApplySettings(selectedBuffer, selectedRes, selectedLowLatency)
+                        statusText = "Applied ${selectedBuffer}s buffer, $selectedRes max resolution, Low-Latency=${if (selectedLowLatency) "ON" else "OFF"}."
+                    }
+                ) {
+                    Text("Apply Optimizer Profile")
+                }
+            }
+        }
+    }
+}
+
+private fun measureDownloadSpeedMbps(
+    urlString: String = "https://speed.cloudflare.com/__down?bytes=10000000"
+): Pair<Float, Int>? {
+    return try {
+        val startTime = System.nanoTime()
+        val conn = (URL(urlString).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8000
+            readTimeout = 10000
+            requestMethod = "GET"
+        }
+        conn.connect()
+        val firstByteTime = System.nanoTime()
+        val ping = ((firstByteTime - startTime) / 1_000_000).toInt().coerceAtLeast(1)
+
+        val buffer = ByteArray(16 * 1024)
+        var totalBytes = 0L
+        conn.inputStream.use { input ->
+            while (true) {
+                val read = input.read(buffer)
+                if (read == -1) break
+                totalBytes += read
+            }
+        }
+        conn.disconnect()
+
+        val elapsedSec = ((System.nanoTime() - firstByteTime) / 1_000_000_000.0).coerceAtLeast(0.05)
+        val mbps = ((totalBytes * 8.0) / (elapsedSec * 1_000_000.0)).toFloat()
+        Pair(mbps, ping)
+    } catch (_: Exception) {
+        null
     }
 }
 
