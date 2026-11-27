@@ -67,6 +67,7 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
@@ -144,12 +145,12 @@ private fun saveConfig(context: Context, config: IptvConfig) {
         .apply()
 }
 
-private fun httpGetText(urlStr: String, timeoutMs: Int = 20000): String {
+private fun httpGetText(urlStr: String, timeoutMs: Int = 25000): String {
     val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
         connectTimeout = timeoutMs
         readTimeout = timeoutMs
         requestMethod = "GET"
-        setRequestProperty("User-Agent", "UnicornTV/2.0 (AndroidTV)")
+        setRequestProperty("User-Agent", "TiviMate/4.7.0 (Android)")
     }
     return try {
         val code = conn.responseCode
@@ -175,15 +176,21 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
             val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
             val apiBase = "$base/player_api.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
 
-            val liveCatMap = parseCategoryMap(runCatching { httpGetText("$apiBase&action=get_live_categories") }.getOrDefault("[]"))
-            val liveJson = JSONArray(httpGetText("$apiBase&action=get_live_streams"))
-            for (i in 0 until liveJson.length()) {
-                val obj = liveJson.getJSONObject(i)
-                val streamId = obj.optString("stream_id")
-                if (streamId.isBlank()) continue
+            // 1. Live Categories & Streams
+            val liveCatMap = parseCategoryMap(
+                runCatching { httpGetText("$apiBase&action=get_live_categories") }.getOrDefault("[]")
+            )
+            val liveRaw = runCatching { httpGetText("$apiBase&action=get_live_streams") }.getOrDefault("[]")
+            parseJsonArrayEntries(liveRaw).forEach { obj ->
+                val streamId = firstNonBlank(
+                    obj.optString("stream_id"),
+                    obj.optString("id"),
+                    obj.optString("num")
+                )
+                if (streamId.isBlank()) return@forEach
                 val name = obj.optString("name", "Channel $streamId")
                 val catId = obj.optString("category_id")
-                val catName = liveCatMap[catId] ?: "Live TV"
+                val catName = liveCatMap[catId] ?: obj.optString("category_name").ifBlank { "Live TV" }
                 val epgId = obj.optString("epg_channel_id", "")
                 liveList.add(
                     MediaEntry(
@@ -197,52 +204,71 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
                 )
             }
 
-            runCatching {
-                val vodCatMap = parseCategoryMap(httpGetText("$apiBase&action=get_vod_categories"))
-                val vodJson = JSONArray(httpGetText("$apiBase&action=get_vod_streams"))
-                for (i in 0 until vodJson.length()) {
-                    val obj = vodJson.getJSONObject(i)
-                    val streamId = obj.optString("stream_id")
-                    if (streamId.isBlank()) continue
-                    val name = obj.optString("name", "Movie $streamId")
-                    val catId = obj.optString("category_id")
-                    val ext = obj.optString("container_extension", "mp4").ifBlank { "mp4" }
-                    movieList.add(
-                        MediaEntry(
-                            id = streamId,
-                            name = name,
-                            category = vodCatMap[catId] ?: "Movies",
-                            streamUrl = "$base/movie/$user/$pass/$streamId.$ext",
-                            kind = MediaKind.MOVIE
-                        )
+            // 2. VOD Movies
+            val vodCatMap = parseCategoryMap(
+                runCatching { httpGetText("$apiBase&action=get_vod_categories") }.getOrDefault("[]")
+            )
+            val vodRaw = runCatching { httpGetText("$apiBase&action=get_vod_streams") }.getOrDefault("[]")
+            parseJsonArrayEntries(vodRaw).forEach { obj ->
+                val streamId = firstNonBlank(
+                    obj.optString("stream_id"),
+                    obj.optString("vod_id"),
+                    obj.optString("id")
+                )
+                if (streamId.isBlank()) return@forEach
+                val name = obj.optString("name", obj.optString("title", "Movie $streamId"))
+                val catId = obj.optString("category_id")
+                val catName = vodCatMap[catId] ?: obj.optString("category_name").ifBlank { "Movies" }
+                val ext = obj.optString("container_extension", "mp4").ifBlank { "mp4" }
+                movieList.add(
+                    MediaEntry(
+                        id = streamId,
+                        name = name,
+                        category = catName,
+                        streamUrl = "$base/movie/$user/$pass/$streamId.$ext",
+                        kind = MediaKind.MOVIE,
+                        plot = obj.optString("plot", "")
                     )
-                }
+                )
             }
 
-            runCatching {
-                val serCatMap = parseCategoryMap(httpGetText("$apiBase&action=get_series_categories"))
-                val serJson = JSONArray(httpGetText("$apiBase&action=get_series"))
-                for (i in 0 until serJson.length()) {
-                    val obj = serJson.getJSONObject(i)
-                    val seriesId = obj.optString("series_id")
-                    if (seriesId.isBlank()) continue
-                    val name = obj.optString("name", "Series $seriesId")
-                    val catId = obj.optString("category_id")
-                    seriesList.add(
-                        MediaEntry(
-                            id = seriesId,
-                            name = name,
-                            category = serCatMap[catId] ?: "Series",
-                            streamUrl = "$apiBase&action=get_series_info&series_id=$seriesId",
-                            kind = MediaKind.SERIES,
-                            plot = obj.optString("plot", "")
-                        )
+            // 3. Series
+            val serCatMap = parseCategoryMap(
+                runCatching { httpGetText("$apiBase&action=get_series_categories") }.getOrDefault("[]")
+            )
+            val serRaw = runCatching { httpGetText("$apiBase&action=get_series") }.getOrDefault("[]")
+            parseJsonArrayEntries(serRaw).forEach { obj ->
+                val seriesId = firstNonBlank(
+                    obj.optString("series_id"),
+                    obj.optString("id")
+                )
+                if (seriesId.isBlank()) return@forEach
+                val name = obj.optString("name", obj.optString("title", "Series $seriesId"))
+                val catId = obj.optString("category_id")
+                val catName = serCatMap[catId] ?: obj.optString("category_name").ifBlank { "Series" }
+                seriesList.add(
+                    MediaEntry(
+                        id = seriesId,
+                        name = name,
+                        category = catName,
+                        streamUrl = "$apiBase&action=get_series_info&series_id=$seriesId",
+                        kind = MediaKind.SERIES,
+                        plot = obj.optString("plot", "")
                     )
-                }
+                )
             }
-        } else if (config.m3uUrl.isNotBlank()) {
+        }
+
+        // If M3U URL is provided and movies or live streams are still empty, parse M3U too
+        if (config.m3uUrl.isNotBlank() && (liveList.isEmpty() || movieList.isEmpty())) {
+            val m3uLive = mutableListOf<MediaEntry>()
+            val m3uMovies = mutableListOf<MediaEntry>()
+            val m3uSeries = mutableListOf<MediaEntry>()
             val rawM3u = httpGetText(config.m3uUrl.trim(), timeoutMs = 30000)
-            parseM3uIntoLists(rawM3u, liveList, movieList, seriesList)
+            parseM3uIntoLists(rawM3u, m3uLive, m3uMovies, m3uSeries)
+            if (liveList.isEmpty()) liveList.addAll(m3uLive)
+            if (movieList.isEmpty()) movieList.addAll(m3uMovies)
+            if (seriesList.isEmpty()) seriesList.addAll(m3uSeries)
         }
     } catch (e: Exception) {
         errorMsg = e.localizedMessage ?: "Failed to load playlist"
@@ -270,13 +296,37 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
     )
 }
 
+private fun firstNonBlank(vararg values: String): String =
+    values.firstOrNull { it.isNotBlank() && it != "null" } ?: ""
+
+private fun parseJsonArrayEntries(raw: String): List<JSONObject> {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return emptyList()
+    val arr = if (trimmed.startsWith("[")) {
+        JSONArray(trimmed)
+    } else if (trimmed.startsWith("{")) {
+        val obj = JSONObject(trimmed)
+        obj.optJSONArray("streams")
+            ?: obj.optJSONArray("vod_streams")
+            ?: obj.optJSONArray("series")
+            ?: obj.optJSONArray("data")
+            ?: JSONArray()
+    } else {
+        JSONArray()
+    }
+    val out = ArrayList<JSONObject>(arr.length())
+    for (i in 0 until arr.length()) {
+        val item = arr.optJSONObject(i)
+        if (item != null) out.add(item)
+    }
+    return out
+}
+
 private fun parseCategoryMap(jsonText: String): Map<String, String> {
     val map = mutableMapOf<String, String>()
-    val arr = JSONArray(jsonText)
-    for (i in 0 until arr.length()) {
-        val obj = arr.getJSONObject(i)
-        val id = obj.optString("category_id")
-        val name = obj.optString("category_name")
+    parseJsonArrayEntries(jsonText).forEach { obj ->
+        val id = firstNonBlank(obj.optString("category_id"), obj.optString("id"))
+        val name = firstNonBlank(obj.optString("category_name"), obj.optString("name"))
         if (id.isNotBlank() && name.isNotBlank()) map[id] = name
     }
     return map
@@ -302,9 +352,10 @@ private fun parseM3uIntoLists(
         } else if (line.startsWith("http://") || line.startsWith("https://")) {
             index++
             val lower = line.lowercase()
+            val groupLower = pendingGroup.lowercase()
             val kind = when {
-                lower.contains("/movie/") || lower.endsWith(".mp4") || lower.endsWith(".mkv") -> MediaKind.MOVIE
-                lower.contains("/series/") -> MediaKind.SERIES
+                lower.contains("/movie/") || lower.endsWith(".mp4") || lower.endsWith(".mkv") || groupLower.contains("vod") || groupLower.contains("movie") -> MediaKind.MOVIE
+                lower.contains("/series/") || groupLower.contains("series") -> MediaKind.SERIES
                 else -> MediaKind.LIVE
             }
             val entry = MediaEntry(
@@ -535,7 +586,7 @@ fun UnicornTvApp() {
                 color = Color(0xFF67E8F9),
                 style = MaterialTheme.typography.bodyMedium
             )
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
             when (selectedSection) {
                 TvSection.SETUP -> SetupAndPlaylistPane(
@@ -561,7 +612,7 @@ fun UnicornTvApp() {
                 TvSection.MOVIES -> CategorizedBrowserPane(
                     items = catalog.movies,
                     epgNow = emptyMap(),
-                    emptyText = "No VOD movies loaded yet. Enter Xtream or M3U details in Setup.",
+                    emptyText = "No VOD movies loaded yet. Check Setup or tap Save & Apply to reload VOD.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
                     onSelectEntry = { playingItem = it }
                 )
@@ -657,18 +708,32 @@ private fun TvGuideWithPreviewPane(
         return
     }
 
+    var searchQuery by remember { mutableStateOf("") }
     val categories = remember(channels) {
         listOf("All (${channels.size})") + channels.map { it.category }.distinct()
     }
     var selectedCategory by remember(categories) { mutableStateOf(categories.first()) }
 
-    val filtered = remember(channels, selectedCategory) {
-        if (selectedCategory.startsWith("All (")) channels
-        else channels.filter { it.category == selectedCategory }
-    }
+    // Keep previewChannel independent of searchQuery so typing in search keeps the preview playing
+    var previewChannel by remember(channels) { mutableStateOf(channels.firstOrNull()) }
+    var previewError by remember(previewChannel?.streamUrl) { mutableStateOf<String?>(null) }
 
-    var previewChannel by remember(filtered) { mutableStateOf(filtered.firstOrNull()) }
-    var previewError by remember(previewChannel) { mutableStateOf<String?>(null) }
+    val filtered = remember(channels, selectedCategory, searchQuery, epgNow) {
+        val byCat = if (selectedCategory.startsWith("All (")) channels
+        else channels.filter { it.category == selectedCategory }
+
+        val q = searchQuery.trim().lowercase()
+        if (q.isEmpty()) {
+            byCat
+        } else {
+            byCat.filter { entry ->
+                val prog = epgNow[entry.epgId].orEmpty()
+                entry.name.lowercase().contains(q) ||
+                    entry.category.lowercase().contains(q) ||
+                    prog.lowercase().contains(q)
+            }
+        }
+    }
 
     val context = LocalContext.current
     val previewPlayer = remember(previewChannel?.streamUrl, config.bufferSeconds, config.maxHeightPx) {
@@ -712,6 +777,10 @@ private fun TvGuideWithPreviewPane(
         }
     }
 
+    val clockLabel = remember {
+        SimpleDateFormat("EEE, MMM d • HH:mm", Locale.getDefault()).format(Date())
+    }
+
     Row(
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         modifier = Modifier.fillMaxSize()
@@ -720,7 +789,7 @@ private fun TvGuideWithPreviewPane(
         LazyColumn(
             verticalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier
-                .width(195.dp)
+                .width(190.dp)
                 .fillMaxHeight()
         ) {
             items(categories) { cat ->
@@ -758,66 +827,96 @@ private fun TvGuideWithPreviewPane(
             }
         }
 
-        // Middle: Channel + EPG Guide List
-        LazyColumn(
+        // Middle: Search Bar + Channel / EPG Guide List
+        Column(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier
                 .weight(1f)
                 .fillMaxHeight()
         ) {
-            items(filtered.take(250)) { entry ->
-                var focused by remember { mutableStateOf(false) }
-                val isPreviewing = previewChannel?.id == entry.id
-                val currentProgram = epgNow[entry.epgId]
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                TvInputField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    label = "Search Guide (Channel or Show)",
+                    imeAction = ImeAction.Search,
+                    modifier = Modifier.weight(1f)
+                )
+                if (searchQuery.isNotEmpty()) {
+                    Button(onClick = { searchQuery = "" }) {
+                        Text("Clear")
+                    }
+                }
+            }
 
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = when {
-                            focused -> Color(0xFF3B1976)
-                            isPreviewing -> Color(0xFF2D145C)
-                            else -> Color(0xFF24104A)
-                        }
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .onFocusChanged { state ->
-                            focused = state.isFocused
-                            if (state.isFocused) {
-                                previewChannel = entry
+            Text(
+                text = "$clockLabel  •  Showing ${filtered.size} channel(s)",
+                color = Color(0xFFCBD5E1),
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxSize()
+            ) {
+                items(filtered.take(250)) { entry ->
+                    var focused by remember { mutableStateOf(false) }
+                    val isPreviewing = previewChannel?.id == entry.id
+                    val currentProgram = epgNow[entry.epgId]
+
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = when {
+                                focused -> Color(0xFF3B1976)
+                                isPreviewing -> Color(0xFF2D145C)
+                                else -> Color(0xFF24104A)
                             }
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .onFocusChanged { state ->
+                                focused = state.isFocused
+                                if (state.isFocused) {
+                                    previewChannel = entry
+                                }
+                            }
+                            .focusable()
+                            .border(
+                                width = if (focused) 2.dp else if (isPreviewing) 1.5.dp else 1.dp,
+                                color = if (focused) Color(0xFF38BDF8) else if (isPreviewing) Color(0xFFD946EF) else Color(0xFF4C1D95),
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clickable {
+                                previewChannel = entry
+                                onOpenFullScreen(entry)
+                            }
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Text(
+                                text = entry.name,
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = currentProgram ?: entry.category,
+                                color = if (currentProgram != null) Color(0xFF4ADE80) else Color(0xFF67E8F9),
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
                         }
-                        .focusable()
-                        .border(
-                            width = if (focused) 2.dp else if (isPreviewing) 1.5.dp else 1.dp,
-                            color = if (focused) Color(0xFF38BDF8) else if (isPreviewing) Color(0xFFD946EF) else Color(0xFF4C1D95),
-                            shape = RoundedCornerShape(10.dp)
-                        )
-                        .clickable {
-                            previewChannel = entry
-                            onOpenFullScreen(entry)
-                        }
-                ) {
-                    Column(modifier = Modifier.padding(10.dp)) {
-                        Text(
-                            text = entry.name,
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = currentProgram ?: entry.category,
-                            color = if (currentProgram != null) Color(0xFF4ADE80) else Color(0xFF67E8F9),
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
                     }
                 }
             }
         }
 
-        // Right: Live Preview Window + Now Playing EPG Info
+        // Right: Persistent Live Preview Window + Now Playing EPG Info
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
             modifier = Modifier
@@ -921,13 +1020,17 @@ private fun CategorizedBrowserPane(
         return
     }
 
+    var searchQuery by remember { mutableStateOf("") }
     val categories = remember(items) {
         listOf("All (${items.size})") + items.map { it.category }.distinct()
     }
     var selectedCategory by remember(categories) { mutableStateOf(categories.first()) }
 
-    val filtered = remember(items, selectedCategory) {
-        if (selectedCategory.startsWith("All (")) items else items.filter { it.category == selectedCategory }
+    val filtered = remember(items, selectedCategory, searchQuery) {
+        val byCat = if (selectedCategory.startsWith("All (")) items
+        else items.filter { it.category == selectedCategory }
+        val q = searchQuery.trim().lowercase()
+        if (q.isEmpty()) byCat else byCat.filter { it.name.lowercase().contains(q) }
     }
 
     Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxSize()) {
@@ -972,45 +1075,58 @@ private fun CategorizedBrowserPane(
             }
         }
 
-        LazyColumn(
+        Column(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier
                 .weight(1f)
                 .fillMaxHeight()
         ) {
-            items(filtered.take(300)) { entry ->
-                var focused by remember { mutableStateOf(false) }
-                val currentProgram = epgNow[entry.epgId]
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (focused) Color(0xFF3B1976) else Color(0xFF24104A)
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .onFocusChanged { focused = it.isFocused }
-                        .focusable()
-                        .border(
-                            width = if (focused) 2.dp else 1.dp,
-                            color = if (focused) Color(0xFF38BDF8) else Color(0xFF4C1D95),
-                            shape = RoundedCornerShape(10.dp)
-                        )
-                        .clickable { onSelectEntry(entry) }
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text(
-                            text = entry.name,
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = currentProgram ?: entry.category,
-                            color = if (currentProgram != null) Color(0xFF4ADE80) else Color(0xFF67E8F9),
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+            TvInputField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                label = "Search Titles",
+                imeAction = ImeAction.Search,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxSize()
+            ) {
+                items(filtered.take(300)) { entry ->
+                    var focused by remember { mutableStateOf(false) }
+                    val currentProgram = epgNow[entry.epgId]
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (focused) Color(0xFF3B1976) else Color(0xFF24104A)
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .onFocusChanged { focused = it.isFocused }
+                            .focusable()
+                            .border(
+                                width = if (focused) 2.dp else 1.dp,
+                                color = if (focused) Color(0xFF38BDF8) else Color(0xFF4C1D95),
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clickable { onSelectEntry(entry) }
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = entry.name,
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = currentProgram ?: entry.category,
+                                color = if (currentProgram != null) Color(0xFF4ADE80) else Color(0xFF67E8F9),
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                 }
             }
