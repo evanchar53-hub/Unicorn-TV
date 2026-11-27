@@ -30,7 +30,7 @@ jobs:
 
       - name: Build Debug APK
         working-directory: ./android-firetv-app
-        run: gradle assembleDebug --no-daemon
+        run: gradle assembleDebug -Pandroid.useAndroidX=true -Pandroid.suppressUnsupportedCompileSdk=35 --no-daemon
 
       - name: Upload Unicorn TV APK
         uses: actions/upload-artifact@v4
