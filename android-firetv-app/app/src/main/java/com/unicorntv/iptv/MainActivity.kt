@@ -329,10 +329,6 @@ private fun TvInputField(
                 color = if (focused) Color(0xFF38BDF8) else Color(0xFF7E22CE),
                 shape = RoundedCornerShape(4.dp)
             )
-            .clickable {
-                focusRequester.requestFocus()
-                keyboardController?.show()
-            }
     )
 }
 
