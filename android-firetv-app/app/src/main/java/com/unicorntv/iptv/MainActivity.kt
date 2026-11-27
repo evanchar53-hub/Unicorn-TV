@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -13,6 +14,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -23,6 +25,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -34,8 +37,10 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -176,6 +181,7 @@ fun UnicornTvApp() {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
+            BrandLogoBadge()
             Text(
                 text = "UTV",
                 color = Color(0xFF38BDF8),
@@ -187,7 +193,7 @@ fun UnicornTvApp() {
                 var isFocused by remember { mutableStateOf(false) }
                 Box(
                     modifier = Modifier
-                        .size(50.dp)
+                        .size(48.dp)
                         .onFocusChanged { isFocused = it.isFocused }
                         .focusable()
                         .background(
@@ -295,6 +301,26 @@ fun UnicornTvApp() {
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun BrandLogoBadge() {
+    val context = LocalContext.current
+    val logoResId = remember {
+        context.resources.getIdentifier("ic_launcher", "drawable", context.packageName)
+    }
+
+    if (logoResId != 0) {
+        Image(
+            painter = painterResource(id = logoResId),
+            contentDescription = "Unicorn TV Logo",
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .size(46.dp)
+                .clip(CircleShape)
+                .border(2.dp, Color(0xFF38BDF8), CircleShape)
+        )
     }
 }
 
