@@ -62,6 +62,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
+import java.io.BufferedInputStream
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
@@ -97,6 +98,12 @@ data class MediaEntry(
     val plot: String = ""
 )
 
+data class EpgSlot(
+    val title: String,
+    val startMs: Long,
+    val stopMs: Long
+)
+
 data class ImDbMetadata(
     val imdbId: String = "",
     val title: String = "",
@@ -112,7 +119,7 @@ data class LoadedCatalog(
     val live: List<MediaEntry> = emptyList(),
     val movies: List<MediaEntry> = emptyList(),
     val series: List<MediaEntry> = emptyList(),
-    val epgNow: Map<String, String> = emptyMap(),
+    val epgTimeline: Map<String, List<EpgSlot>> = emptyMap(),
     val error: String? = null
 )
 
@@ -159,17 +166,20 @@ private fun saveConfig(context: Context, config: IptvConfig) {
         .apply()
 }
 
-private fun httpGetText(urlStr: String, timeoutMs: Int = 25000): String {
+private fun httpGetText(urlStr: String, connectTimeoutMs: Int = 20000, readTimeoutMs: Int = 90000): String {
     val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-        connectTimeout = timeoutMs
-        readTimeout = timeoutMs
+        connectTimeout = connectTimeoutMs
+        readTimeout = readTimeoutMs
         requestMethod = "GET"
         setRequestProperty("User-Agent", "UnicornTV/2.0 (AndroidTV)")
+        setRequestProperty("Accept-Encoding", "identity")
     }
     return try {
         val code = conn.responseCode
         if (code !in 200..299) throw IllegalStateException("HTTP $code")
-        BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
+        BufferedReader(InputStreamReader(BufferedInputStream(conn.inputStream, 65536), Charsets.UTF_8), 65536).use {
+            it.readText()
+        }
     } finally {
         conn.disconnect()
     }
@@ -205,7 +215,7 @@ private suspend fun fetchImDbInfo(
     val url = "https://www.omdbapi.com/?apikey=${Uri.encode(key)}&t=${Uri.encode(cleanTitle)}$yearParam&type=$typeParam"
 
     runCatching {
-        val obj = JSONObject(httpGetText(url, timeoutMs = 10000))
+        val obj = JSONObject(httpGetText(url, connectTimeoutMs = 10000, readTimeoutMs = 15000))
         if (!obj.optString("Response").equals("True", ignoreCase = true)) {
             return@runCatching null
         }
@@ -222,11 +232,14 @@ private suspend fun fetchImDbInfo(
     }.getOrNull()
 }
 
-private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withContext(Dispatchers.IO) {
+private suspend fun fetchFullCatalog(
+    config: IptvConfig,
+    onProgress: (String) -> Unit
+): LoadedCatalog = withContext(Dispatchers.IO) {
     val liveList = mutableListOf<MediaEntry>()
     val movieList = mutableListOf<MediaEntry>()
     val seriesList = mutableListOf<MediaEntry>()
-    var errorMsg: String? = null
+    val warnings = mutableListOf<String>()
 
     val cleanHost = config.xtreamHost.trim().removeSuffix("/")
     val user = config.xtreamUser.trim()
@@ -237,100 +250,100 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
             val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
             val apiBase = "$base/player_api.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
 
+            onProgress("Loading Live TV channels...")
             val liveCatMap = parseCategoryMap(
-                runCatching { httpGetText("$apiBase&action=get_live_categories") }.getOrDefault("[]")
+                runCatching { httpGetText("$apiBase&action=get_live_categories", readTimeoutMs = 45000) }.getOrDefault("[]")
             )
-            val liveRaw = runCatching { httpGetText("$apiBase&action=get_live_streams") }.getOrDefault("[]")
-            parseJsonArrayEntries(liveRaw).forEach { obj ->
-                val streamId = firstNonBlank(
-                    obj.optString("stream_id"),
-                    obj.optString("id"),
-                    obj.optString("num")
-                )
-                if (streamId.isBlank()) return@forEach
-                val name = obj.optString("name", "Channel $streamId")
-                val catId = obj.optString("category_id")
-                val catName = liveCatMap[catId] ?: obj.optString("category_name").ifBlank { "Live TV" }
-                val epgId = obj.optString("epg_channel_id", "")
-                liveList.add(
-                    MediaEntry(
-                        id = streamId,
-                        name = name,
-                        category = catName,
-                        streamUrl = "$base/live/$user/$pass/$streamId.ts",
-                        epgId = epgId,
-                        kind = MediaKind.LIVE
+            runCatching {
+                val liveRaw = httpGetText("$apiBase&action=get_live_streams", readTimeoutMs = 90000)
+                parseJsonArrayEntries(liveRaw).forEach { obj ->
+                    val streamId = firstNonBlank(obj.optString("stream_id"), obj.optString("id"), obj.optString("num"))
+                    if (streamId.isBlank()) return@forEach
+                    val name = obj.optString("name", "Channel $streamId")
+                    val catId = obj.optString("category_id")
+                    val catName = liveCatMap[catId] ?: obj.optString("category_name").ifBlank { "Live TV" }
+                    val epgId = obj.optString("epg_channel_id", "")
+                    liveList.add(
+                        MediaEntry(
+                            id = streamId,
+                            name = name,
+                            category = catName,
+                            streamUrl = "$base/live/$user/$pass/$streamId.ts",
+                            epgId = epgId,
+                            kind = MediaKind.LIVE
+                        )
                     )
-                )
-            }
+                }
+            }.onFailure { warnings.add("Live: ${it.message}") }
 
+            onProgress("Loading VOD Movies (large catalog, please wait)...")
             val vodCatMap = parseCategoryMap(
-                runCatching { httpGetText("$apiBase&action=get_vod_categories") }.getOrDefault("[]")
+                runCatching { httpGetText("$apiBase&action=get_vod_categories", readTimeoutMs = 45000) }.getOrDefault("[]")
             )
-            val vodRaw = runCatching { httpGetText("$apiBase&action=get_vod_streams") }.getOrDefault("[]")
-            parseJsonArrayEntries(vodRaw).forEach { obj ->
-                val streamId = firstNonBlank(
-                    obj.optString("stream_id"),
-                    obj.optString("vod_id"),
-                    obj.optString("id")
-                )
-                if (streamId.isBlank()) return@forEach
-                val name = obj.optString("name", obj.optString("title", "Movie $streamId"))
-                val catId = obj.optString("category_id")
-                val catName = vodCatMap[catId] ?: obj.optString("category_name").ifBlank { "Movies" }
-                val ext = obj.optString("container_extension", "mp4").ifBlank { "mp4" }
-                movieList.add(
-                    MediaEntry(
-                        id = streamId,
-                        name = name,
-                        category = catName,
-                        streamUrl = "$base/movie/$user/$pass/$streamId.$ext",
-                        kind = MediaKind.MOVIE,
-                        plot = obj.optString("plot", "")
+            runCatching {
+                val vodRaw = httpGetText("$apiBase&action=get_vod_streams", readTimeoutMs = 120000)
+                parseJsonArrayEntries(vodRaw).forEach { obj ->
+                    val streamId = firstNonBlank(obj.optString("stream_id"), obj.optString("vod_id"), obj.optString("id"))
+                    if (streamId.isBlank()) return@forEach
+                    val name = obj.optString("name", obj.optString("title", "Movie $streamId"))
+                    val catId = obj.optString("category_id")
+                    val catName = vodCatMap[catId] ?: obj.optString("category_name").ifBlank { "Movies" }
+                    val ext = obj.optString("container_extension", "mp4").ifBlank { "mp4" }
+                    movieList.add(
+                        MediaEntry(
+                            id = streamId,
+                            name = name,
+                            category = catName,
+                            streamUrl = "$base/movie/$user/$pass/$streamId.$ext",
+                            kind = MediaKind.MOVIE,
+                            plot = obj.optString("plot", "")
+                        )
                     )
-                )
-            }
+                }
+            }.onFailure { warnings.add("VOD: ${it.message}") }
 
+            onProgress("Loading TV Series...")
             val serCatMap = parseCategoryMap(
-                runCatching { httpGetText("$apiBase&action=get_series_categories") }.getOrDefault("[]")
+                runCatching { httpGetText("$apiBase&action=get_series_categories", readTimeoutMs = 45000) }.getOrDefault("[]")
             )
-            val serRaw = runCatching { httpGetText("$apiBase&action=get_series") }.getOrDefault("[]")
-            parseJsonArrayEntries(serRaw).forEach { obj ->
-                val seriesId = firstNonBlank(
-                    obj.optString("series_id"),
-                    obj.optString("id")
-                )
-                if (seriesId.isBlank()) return@forEach
-                val name = obj.optString("name", obj.optString("title", "Series $seriesId"))
-                val catId = obj.optString("category_id")
-                val catName = serCatMap[catId] ?: obj.optString("category_name").ifBlank { "Series" }
-                seriesList.add(
-                    MediaEntry(
-                        id = seriesId,
-                        name = name,
-                        category = catName,
-                        streamUrl = "$apiBase&action=get_series_info&series_id=$seriesId",
-                        kind = MediaKind.SERIES,
-                        plot = obj.optString("plot", "")
+            runCatching {
+                val serRaw = httpGetText("$apiBase&action=get_series", readTimeoutMs = 90000)
+                parseJsonArrayEntries(serRaw).forEach { obj ->
+                    val seriesId = firstNonBlank(obj.optString("series_id"), obj.optString("id"))
+                    if (seriesId.isBlank()) return@forEach
+                    val name = obj.optString("name", obj.optString("title", "Series $seriesId"))
+                    val catId = obj.optString("category_id")
+                    val catName = serCatMap[catId] ?: obj.optString("category_name").ifBlank { "Series" }
+                    seriesList.add(
+                        MediaEntry(
+                            id = seriesId,
+                            name = name,
+                            category = catName,
+                            streamUrl = "$apiBase&action=get_series_info&series_id=$seriesId",
+                            kind = MediaKind.SERIES,
+                            plot = obj.optString("plot", "")
+                        )
                     )
-                )
-            }
+                }
+            }.onFailure { warnings.add("Series: ${it.message}") }
         }
 
         if (config.m3uUrl.isNotBlank() && (liveList.isEmpty() || movieList.isEmpty())) {
+            onProgress("Parsing M3U fallback...")
             val m3uLive = mutableListOf<MediaEntry>()
             val m3uMovies = mutableListOf<MediaEntry>()
             val m3uSeries = mutableListOf<MediaEntry>()
-            val rawM3u = httpGetText(config.m3uUrl.trim(), timeoutMs = 30000)
+            val rawM3u = httpGetText(config.m3uUrl.trim(), readTimeoutMs = 90000)
             parseM3uIntoLists(rawM3u, m3uLive, m3uMovies, m3uSeries)
             if (liveList.isEmpty()) liveList.addAll(m3uLive)
             if (movieList.isEmpty()) movieList.addAll(m3uMovies)
             if (seriesList.isEmpty()) seriesList.addAll(m3uSeries)
         }
     } catch (e: Exception) {
-        errorMsg = e.localizedMessage ?: "Failed to load playlist"
+        warnings.add(e.localizedMessage ?: "Failed to load playlist")
     }
 
+    onProgress("Downloading XMLTV EPG guide...")
     val epgUrl = config.epgUrl.trim().ifBlank {
         if (cleanHost.isNotBlank() && user.isNotBlank() && pass.isNotBlank()) {
             val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
@@ -338,8 +351,10 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
         } else ""
     }
 
-    val epgNowMap = if (epgUrl.isNotBlank()) {
-        runCatching { fetchCurrentEpgMap(epgUrl) }.getOrDefault(emptyMap())
+    val timelineMap = if (epgUrl.isNotBlank()) {
+        runCatching { fetchEpgTimelineMap(epgUrl) }
+            .onFailure { warnings.add("EPG: ${it.message}") }
+            .getOrDefault(emptyMap())
     } else {
         emptyMap()
     }
@@ -348,8 +363,8 @@ private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withCo
         live = liveList,
         movies = movieList,
         series = seriesList,
-        epgNow = epgNowMap,
-        error = errorMsg
+        epgTimeline = timelineMap,
+        error = warnings.takeIf { it.isNotEmpty() }?.joinToString(" | ")
     )
 }
 
@@ -433,9 +448,12 @@ private fun parseM3uIntoLists(
     }
 }
 
-private fun fetchCurrentEpgMap(epgUrl: String): Map<String, String> {
+private fun fetchEpgTimelineMap(epgUrl: String): Map<String, List<EpgSlot>> {
     val nowMs = System.currentTimeMillis()
-    val result = mutableMapOf<String, String>()
+    val windowStart = nowMs - 2 * 3600_000L
+    val windowEnd = nowMs + 8 * 3600_000L
+    val grouped = mutableMapOf<String, MutableList<EpgSlot>>()
+
     val fmt = SimpleDateFormat("yyyyMMddHHmmss Z", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
@@ -447,11 +465,11 @@ private fun fetchCurrentEpgMap(epgUrl: String): Map<String, String> {
 
     val conn = (URL(epgUrl).openConnection() as HttpURLConnection).apply {
         connectTimeout = 20000
-        readTimeout = 30000
+        readTimeout = 90000
         requestMethod = "GET"
     }
     try {
-        conn.inputStream.use { stream ->
+        BufferedInputStream(conn.inputStream, 65536).use { stream ->
             val parser = Xml.newPullParser()
             parser.setInput(stream, "UTF-8")
             var event = parser.eventType
@@ -476,8 +494,11 @@ private fun fetchCurrentEpgMap(epgUrl: String): Map<String, String> {
                     }
                     XmlPullParser.END_TAG -> {
                         if (parser.name == "programme" && inProgramme) {
-                            if (progChannel.isNotBlank() && progTitle.isNotBlank() && nowMs in progStart..progStop) {
-                                result[progChannel] = progTitle
+                            if (progChannel.isNotBlank() && progTitle.isNotBlank() && progStop >= windowStart && progStart <= windowEnd) {
+                                val list = grouped.getOrPut(progChannel) { mutableListOf() }
+                                if (list.size < 6) {
+                                    list.add(EpgSlot(progTitle, progStart, progStop))
+                                }
                             }
                             inProgramme = false
                         }
@@ -489,12 +510,12 @@ private fun fetchCurrentEpgMap(epgUrl: String): Map<String, String> {
     } finally {
         conn.disconnect()
     }
-    return result
+    return grouped.mapValues { (_, list) -> list.sortedBy { it.startMs } }
 }
 
 private suspend fun resolveFirstSeriesEpisodeUrl(seriesInfoUrl: String): String? = withContext(Dispatchers.IO) {
     runCatching {
-        val root = JSONObject(httpGetText(seriesInfoUrl))
+        val root = JSONObject(httpGetText(seriesInfoUrl, readTimeoutMs = 30000))
         val episodesObj = root.optJSONObject("episodes") ?: return@runCatching null
         val keys = episodesObj.keys()
         if (!keys.hasNext()) return@runCatching null
@@ -515,7 +536,7 @@ private enum class TvSection(val title: String, val icon: ImageVector) {
     SETUP("Live TV & EPG Setup", Icons.Default.LiveTv),
     GUIDE("TV Guide (EPG)", Icons.Default.CalendarMonth),
     FAVORITES("Favorites", Icons.Default.Star),
-    MULTIVIEW("Multi-View (4x)", Icons.Default.GridView),
+    MULTIVIEW("Multi-View", Icons.Default.GridView),
     MOVIES("Movies (VOD)", Icons.Default.Movie),
     SERIES("Series", Icons.Default.Tv),
     SPEED_OPTIMIZER("Speed Optimizer", Icons.Default.Speed),
@@ -532,20 +553,28 @@ fun UnicornTvApp() {
     var catalog by remember { mutableStateOf(LoadedCatalog()) }
     var isLoadingCatalog by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
-    var playingItem by remember { mutableStateOf<MediaEntry?>(null) }
+
+    // Full-screen player entry + currently watching channel persisted when returning to TV Guide
+    var fullScreenItem by remember { mutableStateOf<MediaEntry?>(null) }
+    var lastWatchedLiveChannel by remember { mutableStateOf<MediaEntry?>(null) }
 
     fun refreshCatalog(cfg: IptvConfig) {
         if (cfg.m3uUrl.isBlank() && cfg.xtreamHost.isBlank()) return
         isLoadingCatalog = true
-        statusMessage = "Downloading playlist, VOD, Series & EPG..."
+        statusMessage = "Connecting to server..."
         scope.launch {
-            val loaded = fetchFullCatalog(cfg)
+            val loaded = fetchFullCatalog(cfg) { progress ->
+                statusMessage = progress
+            }
             catalog = loaded
             isLoadingCatalog = false
+            if (lastWatchedLiveChannel == null) {
+                lastWatchedLiveChannel = loaded.live.firstOrNull { !it.name.startsWith("#") } ?: loaded.live.firstOrNull()
+            }
             statusMessage = if (loaded.error != null) {
-                "Error: ${loaded.error}"
+                "Loaded with notice: ${loaded.error}"
             } else {
-                "Loaded ${loaded.live.size} Live, ${loaded.movies.size} Movies, ${loaded.series.size} Series (${loaded.epgNow.size} EPG active)."
+                "Loaded ${loaded.live.size} Live, ${loaded.movies.size} Movies, ${loaded.series.size} Series (${loaded.epgTimeline.size} EPG channels)."
             }
         }
     }
@@ -559,11 +588,17 @@ fun UnicornTvApp() {
         return
     }
 
-    playingItem?.let { current ->
+    fullScreenItem?.let { current ->
         FullScreenPlayerOverlay(
             entry = current,
             config = config,
-            onClose = { playingItem = null }
+            onBackToGuide = {
+                if (current.kind == MediaKind.LIVE) {
+                    lastWatchedLiveChannel = current
+                    selectedSection = TvSection.GUIDE
+                }
+                fullScreenItem = null
+            }
         )
         return
     }
@@ -639,7 +674,7 @@ fun UnicornTvApp() {
                 style = MaterialTheme.typography.headlineSmall
             )
             Text(
-                text = "Live: ${catalog.live.size}  •  Movies: ${catalog.movies.size}  •  Series: ${catalog.series.size}  •  EPG: ${catalog.epgNow.size}",
+                text = "Live: ${catalog.live.size}  •  Movies: ${catalog.movies.size}  •  Series: ${catalog.series.size}  •  EPG: ${catalog.epgTimeline.size}",
                 color = Color(0xFF67E8F9),
                 style = MaterialTheme.typography.bodyMedium
             )
@@ -658,27 +693,30 @@ fun UnicornTvApp() {
                     }
                 )
 
-                TvSection.GUIDE -> TvGuideWithPreviewPane(
+                TvSection.GUIDE -> RealTvGuidePane(
                     channels = catalog.live,
-                    epgNow = catalog.epgNow,
+                    epgTimeline = catalog.epgTimeline,
+                    activeChannel = lastWatchedLiveChannel,
                     config = config,
+                    onActiveChannelChange = { lastWatchedLiveChannel = it },
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onOpenFullScreen = { playingItem = it }
+                    onOpenFullScreen = { ch ->
+                        lastWatchedLiveChannel = ch
+                        fullScreenItem = ch
+                    }
                 )
 
                 TvSection.MOVIES -> CategorizedBrowserPane(
                     items = catalog.movies,
-                    epgNow = emptyMap(),
                     imdbApiKey = config.imdbApiKey,
                     isSeries = false,
                     emptyText = "No VOD movies loaded yet. Check Setup or tap Save & Apply to reload VOD.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onSelectEntry = { playingItem = it }
+                    onSelectEntry = { fullScreenItem = it }
                 )
 
                 TvSection.SERIES -> CategorizedBrowserPane(
                     items = catalog.series,
-                    epgNow = emptyMap(),
                     imdbApiKey = config.imdbApiKey,
                     isSeries = true,
                     emptyText = "No TV series loaded yet. Enter Xtream or M3U details in Setup.",
@@ -691,7 +729,7 @@ fun UnicornTvApp() {
                                 seriesItem.streamUrl
                             }
                             if (!epUrl.isNullOrBlank()) {
-                                playingItem = seriesItem.copy(streamUrl = epUrl)
+                                fullScreenItem = seriesItem.copy(streamUrl = epUrl)
                             } else {
                                 statusMessage = "Could not resolve episode stream for ${seriesItem.name}."
                             }
@@ -699,7 +737,7 @@ fun UnicornTvApp() {
                     }
                 )
 
-                TvSection.MULTIVIEW -> SafeMultiViewPane(
+                TvSection.MULTIVIEW -> CustomizableMultiViewPane(
                     channels = catalog.live,
                     maxHeightPx = config.maxHeightPx,
                     onGoToSetup = { selectedSection = TvSection.SETUP }
@@ -737,13 +775,15 @@ fun UnicornTvApp() {
                 )
 
                 TvSection.FAVORITES -> CategorizedBrowserPane(
-                    items = catalog.live.take(25),
-                    epgNow = catalog.epgNow,
+                    items = catalog.live.take(30),
                     imdbApiKey = "",
                     isSeries = false,
                     emptyText = "No channels available yet.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onSelectEntry = { playingItem = it }
+                    onSelectEntry = {
+                        lastWatchedLiveChannel = it
+                        fullScreenItem = it
+                    }
                 )
             }
         }
@@ -751,19 +791,18 @@ fun UnicornTvApp() {
 }
 
 @Composable
-private fun TvGuideWithPreviewPane(
+private fun RealTvGuidePane(
     channels: List<MediaEntry>,
-    epgNow: Map<String, String>,
+    epgTimeline: Map<String, List<EpgSlot>>,
+    activeChannel: MediaEntry?,
     config: IptvConfig,
+    onActiveChannelChange: (MediaEntry) -> Unit,
     onGoToSetup: () -> Unit,
     onOpenFullScreen: (MediaEntry) -> Unit
 ) {
     if (channels.isEmpty()) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text(
-                "No live channels loaded yet. Enter Xtream or M3U details in Setup.",
-                color = Color(0xFFFBBF24)
-            )
+            Text("No live channels loaded yet. Enter Xtream or M3U details in Setup.", color = Color(0xFFFBBF24))
             Button(onClick = onGoToSetup) {
                 Text("Go to IPTV & EPG Setup")
             }
@@ -777,10 +816,13 @@ private fun TvGuideWithPreviewPane(
     }
     var selectedCategory by remember(categories) { mutableStateOf(categories.first()) }
 
-    var previewChannel by remember(channels) { mutableStateOf(channels.firstOrNull()) }
-    var previewError by remember(previewChannel?.streamUrl) { mutableStateOf<String?>(null) }
+    val previewChannel = activeChannel ?: channels.first()
+    var previewError by remember(previewChannel.streamUrl) { mutableStateOf<String?>(null) }
 
-    val filtered = remember(channels, selectedCategory, searchQuery, epgNow) {
+    val nowMs = System.currentTimeMillis()
+    val timeFmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+
+    val filtered = remember(channels, selectedCategory, searchQuery, epgTimeline) {
         val byCat = if (selectedCategory.startsWith("All (")) channels
         else channels.filter { it.category == selectedCategory }
 
@@ -789,17 +831,17 @@ private fun TvGuideWithPreviewPane(
             byCat
         } else {
             byCat.filter { entry ->
-                val prog = epgNow[entry.epgId].orEmpty()
+                val slots = epgTimeline[entry.epgId].orEmpty()
                 entry.name.lowercase().contains(q) ||
                     entry.category.lowercase().contains(q) ||
-                    prog.lowercase().contains(q)
+                    slots.any { it.title.lowercase().contains(q) }
             }
         }
     }
 
     val context = LocalContext.current
-    val previewPlayer = remember(previewChannel?.streamUrl, config.bufferSeconds, config.maxHeightPx) {
-        val url = previewChannel?.streamUrl?.trim().orEmpty()
+    val previewPlayer = remember(previewChannel.streamUrl, config.bufferSeconds, config.maxHeightPx) {
+        val url = previewChannel.streamUrl.trim()
         if (url.isBlank()) {
             null
         } else {
@@ -839,221 +881,496 @@ private fun TvGuideWithPreviewPane(
         }
     }
 
-    val clockLabel = remember {
-        SimpleDateFormat("EEE, MMM d • HH:mm", Locale.getDefault()).format(Date())
-    }
-
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        modifier = Modifier.fillMaxSize()
-    ) {
-        LazyColumn(
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxSize()) {
+        // Top Header: Live Video Preview Window + Search Bar (stays playing while typing in Search)
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier
-                .width(190.dp)
-                .fillMaxHeight()
+                .fillMaxWidth()
+                .height(155.dp)
         ) {
-            items(categories) { cat ->
-                val active = cat == selectedCategory
-                var focused by remember { mutableStateOf(false) }
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .onFocusChanged { focused = it.isFocused }
-                        .focusable()
-                        .background(
-                            when {
-                                active -> Color(0xFFD946EF)
-                                focused -> Color(0xFF4C1D95)
-                                else -> Color(0xFF210D44)
-                            },
-                            RoundedCornerShape(8.dp)
-                        )
-                        .border(
-                            width = if (focused) 2.dp else 0.dp,
-                            color = Color(0xFF38BDF8),
-                            shape = RoundedCornerShape(8.dp)
-                        )
-                        .clickable { selectedCategory = cat }
-                        .padding(horizontal = 10.dp, vertical = 9.dp)
-                ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .width(275.dp)
+                    .fillMaxHeight()
+                    .background(Color.Black, RoundedCornerShape(10.dp))
+                    .border(2.dp, Color(0xFF38BDF8), RoundedCornerShape(10.dp))
+                    .clickable { onOpenFullScreen(previewChannel) }
+            ) {
+                if (previewPlayer != null && previewError == null) {
+                    AndroidView(
+                        factory = { ctx ->
+                            PlayerView(ctx).apply {
+                                this.player = previewPlayer
+                                useController = false
+                            }
+                        },
+                        update = { view -> view.player = previewPlayer },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(RoundedCornerShape(10.dp))
+                    )
+                } else {
                     Text(
-                        text = cat,
-                        color = Color.White,
-                        fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        text = previewError ?: "Preview unavailable",
+                        color = Color(0xFFCBD5E1),
+                        style = MaterialTheme.typography.bodySmall
                     )
                 }
             }
-        }
 
-        Column(
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxHeight()
-        ) {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
+            Column(
+                verticalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
             ) {
-                TvInputField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    label = "Search Guide (Channel or Show)",
-                    imeAction = ImeAction.Search,
-                    modifier = Modifier.weight(1f)
-                )
-                if (searchQuery.isNotEmpty()) {
-                    Button(onClick = { searchQuery = "" }) {
-                        Text("Clear")
+                val slots = epgTimeline[previewChannel.epgId].orEmpty()
+                val currentSlot = slots.firstOrNull { nowMs in it.startMs..it.stopMs } ?: slots.firstOrNull()
+                val nextSlot = slots.firstOrNull { it.startMs > (currentSlot?.startMs ?: nowMs) }
+
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Row(
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = previewChannel.name,
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(onClick = { onOpenFullScreen(previewChannel) }) {
+                            Text("Full Screen")
+                        }
+                    }
+                    Text(
+                        text = if (currentSlot != null) {
+                            "Now (${timeFmt.format(Date(currentSlot.startMs))}–${timeFmt.format(Date(currentSlot.stopMs))}): ${currentSlot.title}"
+                        } else {
+                            "Now: No programme info (${previewChannel.category})"
+                        },
+                        color = Color(0xFF4ADE80),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (nextSlot != null) {
+                        Text(
+                            text = "Next (${timeFmt.format(Date(nextSlot.startMs))}): ${nextSlot.title}",
+                            color = Color(0xFF67E8F9),
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                 }
-            }
 
-            Text(
-                text = "$clockLabel  •  Showing ${filtered.size} channel(s)",
-                color = Color(0xFFCBD5E1),
-                style = MaterialTheme.typography.bodySmall
-            )
-
-            LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxSize()
-            ) {
-                items(filtered.take(250)) { entry ->
-                    var focused by remember { mutableStateOf(false) }
-                    val isPreviewing = previewChannel?.id == entry.id
-                    val currentProgram = epgNow[entry.epgId]
-
-                    Card(
-                        colors = CardDefaults.cardColors(
-                            containerColor = when {
-                                focused -> Color(0xFF3B1976)
-                                isPreviewing -> Color(0xFF2D145C)
-                                else -> Color(0xFF24104A)
-                            }
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .onFocusChanged { state ->
-                                focused = state.isFocused
-                                if (state.isFocused) {
-                                    previewChannel = entry
-                                }
-                            }
-                            .focusable()
-                            .border(
-                                width = if (focused) 2.dp else if (isPreviewing) 1.5.dp else 1.dp,
-                                color = if (focused) Color(0xFF38BDF8) else if (isPreviewing) Color(0xFFD946EF) else Color(0xFF4C1D95),
-                                shape = RoundedCornerShape(10.dp)
-                            )
-                            .clickable {
-                                previewChannel = entry
-                                onOpenFullScreen(entry)
-                            }
-                    ) {
-                        Column(modifier = Modifier.padding(10.dp)) {
-                            Text(
-                                text = entry.name,
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = currentProgram ?: entry.category,
-                                color = if (currentProgram != null) Color(0xFF4ADE80) else Color(0xFF67E8F9),
-                                style = MaterialTheme.typography.bodySmall,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    TvInputField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        label = "Search Guide (Video keeps playing)",
+                        imeAction = ImeAction.Search,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (searchQuery.isNotEmpty()) {
+                        Button(onClick = { searchQuery = "" }) {
+                            Text("Clear")
                         }
                     }
                 }
             }
         }
 
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
-            modifier = Modifier
-                .width(340.dp)
-                .fillMaxHeight()
-        ) {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+        // Bottom: TiviMate-style Categories + Time-Slot EPG Grid
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.weight(1f)) {
+            LazyColumn(
+                verticalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier
-                    .fillMaxSize()
-                    .padding(12.dp)
+                    .width(205.dp)
+                    .fillMaxHeight()
             ) {
-                Text(
-                    text = "Live Preview",
-                    color = Color(0xFF38BDF8),
-                    fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.titleSmall
-                )
-
-                Box(
-                    contentAlignment = Alignment.Center,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(190.dp)
-                        .background(Color.Black, RoundedCornerShape(10.dp))
-                        .border(1.dp, Color(0xFF7E22CE), RoundedCornerShape(10.dp))
-                ) {
-                    if (previewPlayer != null && previewError == null) {
-                        AndroidView(
-                            factory = { ctx ->
-                                PlayerView(ctx).apply {
-                                    this.player = previewPlayer
-                                    useController = false
-                                }
-                            },
-                            update = { view -> view.player = previewPlayer },
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .clip(RoundedCornerShape(10.dp))
-                        )
-                    } else {
+                items(categories) { cat ->
+                    val active = cat == selectedCategory
+                    var focused by remember { mutableStateOf(false) }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .onFocusChanged { focused = it.isFocused }
+                            .focusable()
+                            .background(
+                                when {
+                                    active -> Color(0xFFD946EF)
+                                    focused -> Color(0xFF4C1D95)
+                                    else -> Color(0xFF210D44)
+                                },
+                                RoundedCornerShape(8.dp)
+                            )
+                            .border(
+                                width = if (focused) 2.dp else 0.dp,
+                                color = Color(0xFF38BDF8),
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                            .clickable { selectedCategory = cat }
+                            .padding(horizontal = 10.dp, vertical = 9.dp)
+                    ) {
                         Text(
-                            text = previewError ?: "No stream preview",
-                            color = Color(0xFFCBD5E1),
-                            style = MaterialTheme.typography.bodySmall
+                            text = cat,
+                            color = Color.White,
+                            fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
+            }
 
-                val current = previewChannel
-                if (current != null) {
+            Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                // Time-Slot Header Bar
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF1A0B38), RoundedCornerShape(6.dp))
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                ) {
+                    Text("Channel", color = Color(0xFF67E8F9), fontWeight = FontWeight.Bold, modifier = Modifier.width(200.dp))
+                    Text("Now (${timeFmt.format(Date(nowMs))})", color = Color(0xFF4ADE80), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Text("Up Next", color = Color(0xFF67E8F9), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxSize()) {
+                    items(filtered.take(250)) { entry ->
+                        var focused by remember { mutableStateOf(false) }
+                        val isWatching = previewChannel.id == entry.id
+                        val slots = epgTimeline[entry.epgId].orEmpty()
+                        val nowSlot = slots.firstOrNull { nowMs in it.startMs..it.stopMs } ?: slots.firstOrNull()
+                        val nextSlot = slots.firstOrNull { it.startMs > (nowSlot?.startMs ?: nowMs) }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onFocusChanged { state ->
+                                    focused = state.isFocused
+                                    if (state.isFocused) {
+                                        onActiveChannelChange(entry)
+                                    }
+                                }
+                                .focusable()
+                                .background(
+                                    when {
+                                        focused -> Color(0xFF3B1976)
+                                        isWatching -> Color(0xFF2D145C)
+                                        else -> Color(0xFF24104A)
+                                    },
+                                    RoundedCornerShape(8.dp)
+                                )
+                                .border(
+                                    width = if (focused) 2.dp else if (isWatching) 1.5.dp else 1.dp,
+                                    color = if (focused) Color(0xFF38BDF8) else if (isWatching) Color(0xFFD946EF) else Color(0xFF4C1D95),
+                                    shape = RoundedCornerShape(8.dp)
+                                )
+                                .clickable {
+                                    onActiveChannelChange(entry)
+                                    onOpenFullScreen(entry)
+                                }
+                                .padding(horizontal = 10.dp, vertical = 9.dp)
+                        ) {
+                            Text(
+                                text = entry.name,
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.width(200.dp).padding(end = 8.dp)
+                            )
+                            Text(
+                                text = nowSlot?.title ?: "No information",
+                                color = if (nowSlot != null) Color(0xFF4ADE80) else Color(0xFF94A3B8),
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f).padding(end = 8.dp)
+                            )
+                            Text(
+                                text = nextSlot?.let { "${timeFmt.format(Date(it.startMs))} ${it.title}" } ?: "—",
+                                color = Color(0xFFE2E8F0),
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CustomizableMultiViewPane(
+    channels: List<MediaEntry>,
+    maxHeightPx: Int,
+    onGoToSetup: () -> Unit
+) {
+    val context = LocalContext.current
+    if (channels.isEmpty()) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Load channels in Setup before launching Multi-View.", color = Color(0xFFFBBF24))
+            Button(onClick = onGoToSetup) {
+                Text("Open Setup")
+            }
+        }
+        return
+    }
+
+    val playableDefaults = remember(channels) {
+        channels.filter { !it.name.trim().startsWith("#") }.ifEmpty { channels }
+    }
+
+    var screenCount by remember { mutableStateOf(2) }
+    val slotChannels = remember {
+        mutableStateListOf<MediaEntry?>().apply {
+            repeat(4) { idx -> add(playableDefaults.getOrNull(idx)) }
+        }
+    }
+    var activeAudioIndex by remember { mutableStateOf(0) }
+    var pickingSlotIndex by remember { mutableStateOf<Int?>(null) }
+    val tileErrors = remember { mutableStateMapOf<Int, String>() }
+
+    // Channel Picker Dialog for an individual square
+    val targetSlot = pickingSlotIndex
+    if (targetSlot != null) {
+        var pickerQuery by remember { mutableStateOf("") }
+        val pickerList = remember(channels, pickerQuery) {
+            val q = pickerQuery.trim().lowercase()
+            if (q.isEmpty()) playableDefaults.take(150)
+            else channels.filter { it.name.lowercase().contains(q) || it.category.lowercase().contains(q) }.take(150)
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxSize().padding(14.dp)
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
                     Text(
-                        text = current.name,
+                        text = "Select Channel for Screen ${targetSlot + 1}",
                         color = Color.White,
                         fontWeight = FontWeight.Bold,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
+                        style = MaterialTheme.typography.titleMedium
                     )
-                    Text(
-                        text = "Now: ${epgNow[current.epgId] ?: "No EPG data for this channel"}",
-                        color = Color(0xFF4ADE80),
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = "Category: ${current.category}",
-                        color = Color(0xFF67E8F9),
-                        style = MaterialTheme.typography.bodySmall
-                    )
+                    Button(onClick = { pickingSlotIndex = null }) {
+                        Text("Cancel")
+                    }
+                }
+                TvInputField(
+                    value = pickerQuery,
+                    onValueChange = { pickerQuery = it },
+                    label = "Filter channels by name or category",
+                    imeAction = ImeAction.Search,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxSize()) {
+                    items(pickerList) { entry ->
+                        var focused by remember { mutableStateOf(false) }
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (focused) Color(0xFF3B1976) else Color(0xFF24104A)
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onFocusChanged { focused = it.isFocused }
+                                .focusable()
+                                .clickable {
+                                    tileErrors.remove(targetSlot)
+                                    slotChannels[targetSlot] = entry
+                                    pickingSlotIndex = null
+                                }
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Text(entry.name, color = Color.White, fontWeight = FontWeight.Bold)
+                                Text(entry.category, color = Color(0xFF67E8F9), style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
 
-                    Spacer(modifier = Modifier.weight(1f))
+    val activeUrls = List(4) { idx -> if (idx < screenCount) slotChannels[idx]?.streamUrl?.trim().orEmpty() else "" }
+    val players = remember(activeUrls, maxHeightPx) {
+        activeUrls.mapIndexed { idx, stream ->
+            if (stream.isEmpty()) {
+                null
+            } else {
+                try {
+                    ExoPlayer.Builder(context).build().apply {
+                        trackSelectionParameters = trackSelectionParameters
+                            .buildUpon()
+                            .setMaxVideoSize(1280, maxHeightPx)
+                            .build()
+                        volume = if (idx == activeAudioIndex) 1f else 0f
+                        playWhenReady = true
+                        addListener(object : Player.Listener {
+                            override fun onPlayerError(error: PlaybackException) {
+                                tileErrors[idx] = error.errorCodeName
+                            }
+                        })
+                        setMediaItem(MediaItem.fromUri(Uri.parse(stream)))
+                        prepare()
+                    }
+                } catch (e: Exception) {
+                    tileErrors[idx] = e.localizedMessage ?: "Player init failed"
+                    null
+                }
+            }
+        }
+    }
 
-                    Button(
-                        onClick = { onOpenFullScreen(current) },
-                        modifier = Modifier.fillMaxWidth()
+    LaunchedEffect(activeAudioIndex, players) {
+        players.forEachIndexed { idx, player ->
+            player?.volume = if (idx == activeAudioIndex) 1f else 0f
+        }
+    }
+
+    DisposableEffect(players) {
+        onDispose {
+            players.forEach { player ->
+                runCatching {
+                    player?.stop()
+                    player?.release()
+                }
+            }
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
+        // Screen Count Selector (2, 3, or 4 Screens)
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Screens:", color = Color.White, fontWeight = FontWeight.SemiBold)
+            listOf(2, 3, 4).forEach { count ->
+                val selected = screenCount == count
+                Button(
+                    onClick = {
+                        screenCount = count
+                        if (activeAudioIndex >= count) activeAudioIndex = 0
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selected) Color(0xFFD946EF) else Color(0xFF3B1976)
+                    )
+                ) {
+                    Text("$count Screens")
+                }
+            }
+            Spacer(modifier = Modifier.weight(1f))
+            Text(
+                text = "Tap tile for Audio • Tap 'Pick Channel' to change stream",
+                color = Color(0xFFCBD5E1),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+
+        // Dynamic Grid for 2, 3, or 4 Screens
+        val rows: List<List<Int>> = when (screenCount) {
+            2 -> listOf(listOf(0, 1))
+            3 -> listOf(listOf(0, 1), listOf(2))
+            else -> listOf(listOf(0, 1), listOf(2, 3))
+        }
+
+        rows.forEach { rowIndices ->
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            ) {
+                rowIndices.forEach { idx ->
+                    val ch = slotChannels[idx]
+                    val player = players[idx]
+                    val err = tileErrors[idx]
+
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .background(Color(0xFF090414), RoundedCornerShape(10.dp))
+                            .border(
+                                width = if (idx == activeAudioIndex) 2.dp else 1.dp,
+                                color = if (idx == activeAudioIndex) Color(0xFF38BDF8) else Color(0xFF581C87),
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .clickable { activeAudioIndex = idx },
+                        contentAlignment = Alignment.Center
                     ) {
-                        Text("Watch Full Screen")
+                        if (player != null && err == null) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    PlayerView(ctx).apply {
+                                        this.player = player
+                                        useController = false
+                                    }
+                                },
+                                update = { view -> view.player = player },
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            Text(
+                                text = ch?.name?.let { "$it — ${err ?: "Unavailable"}" } ?: "Screen ${idx + 1} Empty",
+                                color = Color(0xFFCBD5E1),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+
+                        // Top overlay bar per square: Channel name + Pick Channel button
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .fillMaxWidth()
+                                .background(Color(0x9914072B))
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = "${if (idx == activeAudioIndex) "🔊 " else ""}${ch?.name ?: "Screen ${idx + 1}"}",
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Button(
+                                onClick = { pickingSlotIndex = idx },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Text("Pick Channel", style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
                     }
                 }
             }
@@ -1064,7 +1381,6 @@ private fun TvGuideWithPreviewPane(
 @Composable
 private fun CategorizedBrowserPane(
     items: List<MediaEntry>,
-    epgNow: Map<String, String>,
     imdbApiKey: String,
     isSeries: Boolean,
     emptyText: String,
@@ -1177,7 +1493,6 @@ private fun CategorizedBrowserPane(
             ) {
                 items(filtered.take(300)) { entry ->
                     var focused by remember { mutableStateOf(false) }
-                    val currentProgram = epgNow[entry.epgId]
                     Card(
                         colors = CardDefaults.cardColors(
                             containerColor = if (focused) Color(0xFF3B1976) else Color(0xFF24104A)
@@ -1210,8 +1525,8 @@ private fun CategorizedBrowserPane(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = currentProgram ?: entry.category,
-                                color = if (currentProgram != null) Color(0xFF4ADE80) else Color(0xFF67E8F9),
+                                text = entry.category,
+                                color = Color(0xFF67E8F9),
                                 style = MaterialTheme.typography.bodySmall,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
@@ -1325,10 +1640,10 @@ private fun CategorizedBrowserPane(
 private fun FullScreenPlayerOverlay(
     entry: MediaEntry,
     config: IptvConfig,
-    onClose: () -> Unit
+    onBackToGuide: () -> Unit
 ) {
     val context = LocalContext.current
-    BackHandler { onClose() }
+    BackHandler { onBackToGuide() }
 
     val player = remember(entry.streamUrl, config.bufferSeconds, config.maxHeightPx) {
         val bufferMs = (config.bufferSeconds * 1000).coerceIn(5000, 50000)
@@ -1383,8 +1698,8 @@ private fun FullScreenPlayerOverlay(
                 .background(Color(0xAA14072B), RoundedCornerShape(10.dp))
                 .padding(horizontal = 14.dp, vertical = 8.dp)
         ) {
-            Button(onClick = onClose) {
-                Text("← Back")
+            Button(onClick = onBackToGuide) {
+                Text("← Back to Guide")
             }
             Text(
                 text = "${entry.name} (${entry.category})",
@@ -1614,7 +1929,7 @@ private fun SetupAndPlaylistPane(
                 Text(if (isLoading) "Loading Catalog..." else "Save & Apply IPTV / EPG")
             }
             if (statusMessage.isNotBlank()) {
-                Text(statusMessage, color = Color(0xFF4ADE80))
+                Text(statusMessage, color = Color(0xFF4ADE80), modifier = Modifier.weight(1f))
             }
         }
 
@@ -1623,132 +1938,11 @@ private fun SetupAndPlaylistPane(
         }
 
         Text(
-            text = "Summary: ${catalog.live.size} Live Channels, ${catalog.movies.size} Movies, ${catalog.series.size} Series, ${catalog.epgNow.size} Active EPG Shows",
+            text = "Summary: ${catalog.live.size} Live Channels, ${catalog.movies.size} Movies, ${catalog.series.size} Series, ${catalog.epgTimeline.size} EPG Channels",
             color = Color.White,
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier.padding(top = 6.dp)
         )
-    }
-}
-
-@Composable
-private fun SafeMultiViewPane(
-    channels: List<MediaEntry>,
-    maxHeightPx: Int,
-    onGoToSetup: () -> Unit
-) {
-    val context = LocalContext.current
-    val slots = remember(channels) {
-        List(4) { index -> channels.getOrNull(index) }
-    }
-    var activeAudioIndex by remember { mutableStateOf(0) }
-    val tileErrors = remember { mutableStateMapOf<Int, String>() }
-
-    if (channels.isEmpty()) {
-        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Load channels in Setup before launching Multi-View.", color = Color(0xFFFBBF24))
-            Button(onClick = onGoToSetup) {
-                Text("Open Setup")
-            }
-        }
-        return
-    }
-
-    val players = remember(slots, maxHeightPx) {
-        slots.mapIndexed { idx, item ->
-            val stream = item?.streamUrl?.trim().orEmpty()
-            if (stream.isEmpty()) {
-                null
-            } else {
-                try {
-                    ExoPlayer.Builder(context).build().apply {
-                        trackSelectionParameters = trackSelectionParameters
-                            .buildUpon()
-                            .setMaxVideoSize(1280, maxHeightPx)
-                            .build()
-                        volume = if (idx == activeAudioIndex) 1f else 0f
-                        playWhenReady = true
-                        addListener(object : Player.Listener {
-                            override fun onPlayerError(error: PlaybackException) {
-                                tileErrors[idx] = error.errorCodeName
-                            }
-                        })
-                        setMediaItem(MediaItem.fromUri(Uri.parse(stream)))
-                        prepare()
-                    }
-                } catch (e: Exception) {
-                    tileErrors[idx] = e.localizedMessage ?: "Player init failed"
-                    null
-                }
-            }
-        }
-    }
-
-    LaunchedEffect(activeAudioIndex, players) {
-        players.forEachIndexed { idx, player ->
-            player?.volume = if (idx == activeAudioIndex) 1f else 0f
-        }
-    }
-
-    DisposableEffect(players) {
-        onDispose {
-            players.forEach { player ->
-                runCatching {
-                    player?.stop()
-                    player?.release()
-                }
-            }
-        }
-    }
-
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
-        for (row in 0..1) {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-            ) {
-                for (col in 0..1) {
-                    val idx = row * 2 + col
-                    val ch = slots[idx]
-                    val player = players[idx]
-                    val err = tileErrors[idx]
-
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                            .background(Color(0xFF090414), RoundedCornerShape(10.dp))
-                            .border(
-                                width = if (idx == activeAudioIndex) 2.dp else 1.dp,
-                                color = if (idx == activeAudioIndex) Color(0xFF38BDF8) else Color(0xFF581C87),
-                                shape = RoundedCornerShape(10.dp)
-                            )
-                            .clickable { activeAudioIndex = idx },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        if (player != null && err == null) {
-                            AndroidView(
-                                factory = { ctx ->
-                                    PlayerView(ctx).apply {
-                                        this.player = player
-                                        useController = false
-                                    }
-                                },
-                                update = { view -> view.player = player },
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        } else {
-                            Text(
-                                text = ch?.name?.let { "$it — ${err ?: "Unavailable"}" } ?: "Empty Slot ${idx + 1}",
-                                color = Color(0xFFCBD5E1)
-                            )
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
