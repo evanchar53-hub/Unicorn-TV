@@ -30,8 +30,9 @@ jobs:
 
       - name: Build Debug APK
         working-directory: ./android-firetv-app
+        env:
+          GRADLE_OPTS: "-Xmx3072m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8"
         run: gradle assembleDebug -Pandroid.useAndroidX=true -Pandroid.suppressUnsupportedCompileSdk=35 --no-daemon
-
       - name: Upload Unicorn TV APK
         uses: actions/upload-artifact@v4
         with:
