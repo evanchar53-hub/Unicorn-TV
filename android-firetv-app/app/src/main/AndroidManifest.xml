@@ -15,7 +15,7 @@
     <application
         android:allowBackup="true"
         android:banner="@drawable/tv_banner"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@drawable/ic_launcher
         android:label="Unicorn TV"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar"
