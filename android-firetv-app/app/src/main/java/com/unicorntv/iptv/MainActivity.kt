@@ -3,7 +3,9 @@ package com.unicorntv.iptv
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
+import android.util.Xml
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -45,18 +47,28 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import org.xmlpull.v1.XmlPullParser
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
 data class IptvConfig(
     val m3uUrl: String = "",
@@ -71,10 +83,24 @@ data class IptvConfig(
     val lowLatencyMode: Boolean = false
 )
 
-data class ChannelItem(
+enum class MediaKind { LIVE, MOVIE, SERIES }
+
+data class MediaEntry(
+    val id: String,
     val name: String,
-    val group: String,
-    val streamUrl: String
+    val category: String,
+    val streamUrl: String,
+    val epgId: String = "",
+    val kind: MediaKind = MediaKind.LIVE,
+    val plot: String = ""
+)
+
+data class LoadedCatalog(
+    val live: List<MediaEntry> = emptyList(),
+    val movies: List<MediaEntry> = emptyList(),
+    val series: List<MediaEntry> = emptyList(),
+    val epgNow: Map<String, String> = emptyMap(),
+    val error: String? = null
 )
 
 class MainActivity : ComponentActivity() {
@@ -118,22 +144,263 @@ private fun saveConfig(context: Context, config: IptvConfig) {
         .apply()
 }
 
-private fun buildChannelsFromConfig(config: IptvConfig): List<ChannelItem> {
-    val list = mutableListOf<ChannelItem>()
-    if (config.m3uUrl.isNotBlank()) {
-        list.add(ChannelItem("Custom M3U Stream 1", "M3U Playlist", config.m3uUrl.trim()))
+private fun httpGetText(urlStr: String, timeoutMs: Int = 20000): String {
+    val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+        connectTimeout = timeoutMs
+        readTimeout = timeoutMs
+        requestMethod = "GET"
+        setRequestProperty("User-Agent", "UnicornTV/2.0 (AndroidTV)")
     }
-    if (config.xtreamHost.isNotBlank() && config.xtreamUser.isNotBlank() && config.xtreamPass.isNotBlank()) {
-        val cleanHost = config.xtreamHost.trim().removeSuffix("/")
-        val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
-        val user = config.xtreamUser.trim()
-        val pass = config.xtreamPass.trim()
-        list.add(ChannelItem("Xtream Ch 101", "Live TV", "$base/live/$user/$pass/101.m3u8"))
-        list.add(ChannelItem("Xtream Ch 102", "Live TV", "$base/live/$user/$pass/102.m3u8"))
-        list.add(ChannelItem("Xtream Ch 103", "Live TV", "$base/live/$user/$pass/103.m3u8"))
-        list.add(ChannelItem("Xtream Ch 104", "Live TV", "$base/live/$user/$pass/104.m3u8"))
+    return try {
+        val code = conn.responseCode
+        if (code !in 200..299) throw IllegalStateException("HTTP $code")
+        BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { it.readText() }
+    } finally {
+        conn.disconnect()
     }
-    return list
+}
+
+private suspend fun fetchFullCatalog(config: IptvConfig): LoadedCatalog = withContext(Dispatchers.IO) {
+    val liveList = mutableListOf<MediaEntry>()
+    val movieList = mutableListOf<MediaEntry>()
+    val seriesList = mutableListOf<MediaEntry>()
+    var errorMsg: String? = null
+
+    val cleanHost = config.xtreamHost.trim().removeSuffix("/")
+    val user = config.xtreamUser.trim()
+    val pass = config.xtreamPass.trim()
+
+    try {
+        if (cleanHost.isNotBlank() && user.isNotBlank() && pass.isNotBlank()) {
+            val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
+            val apiBase = "$base/player_api.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
+
+            val liveCatMap = parseCategoryMap(runCatching { httpGetText("$apiBase&action=get_live_categories") }.getOrDefault("[]"))
+            val liveJson = JSONArray(httpGetText("$apiBase&action=get_live_streams"))
+            for (i in 0 until liveJson.length()) {
+                val obj = liveJson.getJSONObject(i)
+                val streamId = obj.optString("stream_id")
+                if (streamId.isBlank()) continue
+                val name = obj.optString("name", "Channel $streamId")
+                val catId = obj.optString("category_id")
+                val catName = liveCatMap[catId] ?: "Live TV"
+                val epgId = obj.optString("epg_channel_id", "")
+                liveList.add(
+                    MediaEntry(
+                        id = streamId,
+                        name = name,
+                        category = catName,
+                        streamUrl = "$base/live/$user/$pass/$streamId.ts",
+                        epgId = epgId,
+                        kind = MediaKind.LIVE
+                    )
+                )
+            }
+
+            runCatching {
+                val vodCatMap = parseCategoryMap(httpGetText("$apiBase&action=get_vod_categories"))
+                val vodJson = JSONArray(httpGetText("$apiBase&action=get_vod_streams"))
+                for (i in 0 until vodJson.length()) {
+                    val obj = vodJson.getJSONObject(i)
+                    val streamId = obj.optString("stream_id")
+                    if (streamId.isBlank()) continue
+                    val name = obj.optString("name", "Movie $streamId")
+                    val catId = obj.optString("category_id")
+                    val ext = obj.optString("container_extension", "mp4").ifBlank { "mp4" }
+                    movieList.add(
+                        MediaEntry(
+                            id = streamId,
+                            name = name,
+                            category = vodCatMap[catId] ?: "Movies",
+                            streamUrl = "$base/movie/$user/$pass/$streamId.$ext",
+                            kind = MediaKind.MOVIE
+                        )
+                    )
+                }
+            }
+
+            runCatching {
+                val serCatMap = parseCategoryMap(httpGetText("$apiBase&action=get_series_categories"))
+                val serJson = JSONArray(httpGetText("$apiBase&action=get_series"))
+                for (i in 0 until serJson.length()) {
+                    val obj = serJson.getJSONObject(i)
+                    val seriesId = obj.optString("series_id")
+                    if (seriesId.isBlank()) continue
+                    val name = obj.optString("name", "Series $seriesId")
+                    val catId = obj.optString("category_id")
+                    seriesList.add(
+                        MediaEntry(
+                            id = seriesId,
+                            name = name,
+                            category = serCatMap[catId] ?: "Series",
+                            streamUrl = "$apiBase&action=get_series_info&series_id=$seriesId",
+                            kind = MediaKind.SERIES,
+                            plot = obj.optString("plot", "")
+                        )
+                    )
+                }
+            }
+        } else if (config.m3uUrl.isNotBlank()) {
+            val rawM3u = httpGetText(config.m3uUrl.trim(), timeoutMs = 30000)
+            parseM3uIntoLists(rawM3u, liveList, movieList, seriesList)
+        }
+    } catch (e: Exception) {
+        errorMsg = e.localizedMessage ?: "Failed to load playlist"
+    }
+
+    val epgUrl = config.epgUrl.trim().ifBlank {
+        if (cleanHost.isNotBlank() && user.isNotBlank() && pass.isNotBlank()) {
+            val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
+            "$base/xmltv.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
+        } else ""
+    }
+
+    val epgNowMap = if (epgUrl.isNotBlank()) {
+        runCatching { fetchCurrentEpgMap(epgUrl) }.getOrDefault(emptyMap())
+    } else {
+        emptyMap()
+    }
+
+    LoadedCatalog(
+        live = liveList,
+        movies = movieList,
+        series = seriesList,
+        epgNow = epgNowMap,
+        error = errorMsg
+    )
+}
+
+private fun parseCategoryMap(jsonText: String): Map<String, String> {
+    val map = mutableMapOf<String, String>()
+    val arr = JSONArray(jsonText)
+    for (i in 0 until arr.length()) {
+        val obj = arr.getJSONObject(i)
+        val id = obj.optString("category_id")
+        val name = obj.optString("category_name")
+        if (id.isNotBlank() && name.isNotBlank()) map[id] = name
+    }
+    return map
+}
+
+private fun parseM3uIntoLists(
+    content: String,
+    liveOut: MutableList<MediaEntry>,
+    movieOut: MutableList<MediaEntry>,
+    seriesOut: MutableList<MediaEntry>
+) {
+    var pendingName = ""
+    var pendingGroup = "General"
+    var pendingTvgId = ""
+    var index = 0
+
+    content.lineSequence().forEach { rawLine ->
+        val line = rawLine.trim()
+        if (line.startsWith("#EXTINF:")) {
+            pendingGroup = Regex("""group-title="([^"]*)"""").find(line)?.groupValues?.getOrNull(1)?.ifBlank { "General" } ?: "General"
+            pendingTvgId = Regex("""tvg-id="([^"]*)"""").find(line)?.groupValues?.getOrNull(1) ?: ""
+            pendingName = line.substringAfterLast(",").trim().ifBlank { "Stream ${index + 1}" }
+        } else if (line.startsWith("http://") || line.startsWith("https://")) {
+            index++
+            val lower = line.lowercase()
+            val kind = when {
+                lower.contains("/movie/") || lower.endsWith(".mp4") || lower.endsWith(".mkv") -> MediaKind.MOVIE
+                lower.contains("/series/") -> MediaKind.SERIES
+                else -> MediaKind.LIVE
+            }
+            val entry = MediaEntry(
+                id = "m3u_$index",
+                name = pendingName.ifBlank { "Channel $index" },
+                category = pendingGroup,
+                streamUrl = line,
+                epgId = pendingTvgId,
+                kind = kind
+            )
+            when (kind) {
+                MediaKind.LIVE -> liveOut.add(entry)
+                MediaKind.MOVIE -> movieOut.add(entry)
+                MediaKind.SERIES -> seriesOut.add(entry)
+            }
+            pendingName = ""
+        }
+    }
+}
+
+private fun fetchCurrentEpgMap(epgUrl: String): Map<String, String> {
+    val nowMs = System.currentTimeMillis()
+    val result = mutableMapOf<String, String>()
+    val fmt = SimpleDateFormat("yyyyMMddHHmmss Z", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+    }
+
+    fun parseXmltvTime(raw: String): Long {
+        val normalized = if (raw.contains(" ")) raw else "$raw +0000"
+        return runCatching { fmt.parse(normalized)?.time ?: 0L }.getOrDefault(0L)
+    }
+
+    val conn = (URL(epgUrl).openConnection() as HttpURLConnection).apply {
+        connectTimeout = 20000
+        readTimeout = 30000
+        requestMethod = "GET"
+    }
+    try {
+        conn.inputStream.use { stream ->
+            val parser = Xml.newPullParser()
+            parser.setInput(stream, "UTF-8")
+            var event = parser.eventType
+            var inProgramme = false
+            var progChannel = ""
+            var progStart = 0L
+            var progStop = 0L
+            var progTitle = ""
+
+            while (event != XmlPullParser.END_DOCUMENT) {
+                when (event) {
+                    XmlPullParser.START_TAG -> {
+                        if (parser.name == "programme") {
+                            inProgramme = true
+                            progChannel = parser.getAttributeValue(null, "channel") ?: ""
+                            progStart = parseXmltvTime(parser.getAttributeValue(null, "start") ?: "")
+                            progStop = parseXmltvTime(parser.getAttributeValue(null, "stop") ?: "")
+                            progTitle = ""
+                        } else if (inProgramme && parser.name == "title") {
+                            progTitle = parser.nextText()
+                        }
+                    }
+                    XmlPullParser.END_TAG -> {
+                        if (parser.name == "programme" && inProgramme) {
+                            if (progChannel.isNotBlank() && progTitle.isNotBlank() && nowMs in progStart..progStop) {
+                                result[progChannel] = progTitle
+                            }
+                            inProgramme = false
+                        }
+                    }
+                }
+                event = parser.next()
+            }
+        }
+    } finally {
+        conn.disconnect()
+    }
+    return result
+}
+
+private suspend fun resolveFirstSeriesEpisodeUrl(seriesInfoUrl: String): String? = withContext(Dispatchers.IO) {
+    runCatching {
+        val root = JSONObject(httpGetText(seriesInfoUrl))
+        val episodesObj = root.optJSONObject("episodes") ?: return@runCatching null
+        val keys = episodesObj.keys()
+        if (!keys.hasNext()) return@runCatching null
+        val firstSeasonArr = episodesObj.getJSONArray(keys.next())
+        if (firstSeasonArr.length() == 0) return@runCatching null
+        val ep = firstSeasonArr.getJSONObject(0)
+        val epId = ep.optString("id")
+        val ext = ep.optString("container_extension", "mp4").ifBlank { "mp4" }
+        val base = seriesInfoUrl.substringBefore("/player_api.php")
+        val query = seriesInfoUrl.substringAfter("?")
+        val user = Regex("""username=([^&]+)""").find(query)?.groupValues?.getOrNull(1) ?: ""
+        val pass = Regex("""password=([^&]+)""").find(query)?.groupValues?.getOrNull(1) ?: ""
+        "$base/series/$user/$pass/$epId.$ext"
+    }.getOrNull()
 }
 
 private enum class TvSection(val title: String, val icon: ImageVector) {
@@ -150,15 +417,45 @@ private enum class TvSection(val title: String, val icon: ImageVector) {
 @Composable
 fun UnicornTvApp() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var config by remember { mutableStateOf(loadConfig(context)) }
     var showIntro by remember { mutableStateOf(config.playIntroOnStart) }
     var selectedSection by remember { mutableStateOf(TvSection.SETUP) }
-    var channels by remember { mutableStateOf(buildChannelsFromConfig(config)) }
+    var catalog by remember { mutableStateOf(LoadedCatalog()) }
+    var isLoadingCatalog by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
+    var playingItem by remember { mutableStateOf<MediaEntry?>(null) }
+
+    fun refreshCatalog(cfg: IptvConfig) {
+        if (cfg.m3uUrl.isBlank() && cfg.xtreamHost.isBlank()) return
+        isLoadingCatalog = true
+        statusMessage = "Downloading playlist, VOD, Series & EPG..."
+        scope.launch {
+            val loaded = fetchFullCatalog(cfg)
+            catalog = loaded
+            isLoadingCatalog = false
+            statusMessage = if (loaded.error != null) {
+                "Error: ${loaded.error}"
+            } else {
+                "Loaded ${loaded.live.size} Live, ${loaded.movies.size} Movies, ${loaded.series.size} Series (${loaded.epgNow.size} EPG active)."
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        refreshCatalog(config)
+    }
 
     if (showIntro) {
-        IntroVideoOverlay(
-            onFinish = { showIntro = false }
+        IntroVideoOverlay(onFinish = { showIntro = false })
+        return
+    }
+
+    playingItem?.let { current ->
+        FullScreenPlayerOverlay(
+            entry = current,
+            config = config,
+            onClose = { playingItem = null }
         )
         return
     }
@@ -173,7 +470,6 @@ fun UnicornTvApp() {
             .background(nebulaBg)
             .padding(16.dp)
     ) {
-        // Left D-Pad Friendly Rail (8 sections)
         Column(
             modifier = Modifier
                 .width(76.dp)
@@ -223,7 +519,6 @@ fun UnicornTvApp() {
 
         Spacer(modifier = Modifier.width(20.dp))
 
-        // Main Content Pane
         Column(
             modifier = Modifier
                 .weight(1f)
@@ -236,27 +531,64 @@ fun UnicornTvApp() {
                 style = MaterialTheme.typography.headlineSmall
             )
             Text(
-                text = "Ready for 720p–4K60 HDR streams, XMLTV EPG guide, PiP, and Multi-View.",
+                text = "Live: ${catalog.live.size}  •  Movies: ${catalog.movies.size}  •  Series: ${catalog.series.size}  •  EPG: ${catalog.epgNow.size}",
                 color = Color(0xFF67E8F9),
                 style = MaterialTheme.typography.bodyMedium
             )
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
             when (selectedSection) {
                 TvSection.SETUP -> SetupAndPlaylistPane(
                     config = config,
-                    channels = channels,
+                    catalog = catalog,
+                    isLoading = isLoadingCatalog,
                     statusMessage = statusMessage,
                     onSave = { updated ->
                         config = updated
                         saveConfig(context, updated)
-                        channels = buildChannelsFromConfig(updated)
-                        statusMessage = "Saved! Loaded ${channels.size} stream(s)."
+                        refreshCatalog(updated)
+                    }
+                )
+
+                TvSection.GUIDE -> TvGuideWithPreviewPane(
+                    channels = catalog.live,
+                    epgNow = catalog.epgNow,
+                    config = config,
+                    onGoToSetup = { selectedSection = TvSection.SETUP },
+                    onOpenFullScreen = { playingItem = it }
+                )
+
+                TvSection.MOVIES -> CategorizedBrowserPane(
+                    items = catalog.movies,
+                    epgNow = emptyMap(),
+                    emptyText = "No VOD movies loaded yet. Enter Xtream or M3U details in Setup.",
+                    onGoToSetup = { selectedSection = TvSection.SETUP },
+                    onSelectEntry = { playingItem = it }
+                )
+
+                TvSection.SERIES -> CategorizedBrowserPane(
+                    items = catalog.series,
+                    epgNow = emptyMap(),
+                    emptyText = "No TV series loaded yet. Enter Xtream or M3U details in Setup.",
+                    onGoToSetup = { selectedSection = TvSection.SETUP },
+                    onSelectEntry = { seriesItem ->
+                        scope.launch {
+                            val epUrl = if (seriesItem.streamUrl.contains("get_series_info")) {
+                                resolveFirstSeriesEpisodeUrl(seriesItem.streamUrl)
+                            } else {
+                                seriesItem.streamUrl
+                            }
+                            if (!epUrl.isNullOrBlank()) {
+                                playingItem = seriesItem.copy(streamUrl = epUrl)
+                            } else {
+                                statusMessage = "Could not resolve episode stream for ${seriesItem.name}."
+                            }
+                        }
                     }
                 )
 
                 TvSection.MULTIVIEW -> SafeMultiViewPane(
-                    channels = channels,
+                    channels = catalog.live,
                     maxHeightPx = config.maxHeightPx,
                     onGoToSetup = { selectedSection = TvSection.SETUP }
                 )
@@ -288,18 +620,474 @@ fun UnicornTvApp() {
                     onUpdate = { updated ->
                         config = updated
                         saveConfig(context, updated)
-                        channels = buildChannelsFromConfig(updated)
                         statusMessage = "Settings updated."
                     }
                 )
 
-                else -> ChannelListPane(
-                    section = selectedSection,
-                    channels = channels,
-                    epgUrl = config.epgUrl,
-                    onGoToSetup = { selectedSection = TvSection.SETUP }
+                TvSection.FAVORITES -> CategorizedBrowserPane(
+                    items = catalog.live.take(25),
+                    epgNow = catalog.epgNow,
+                    emptyText = "No channels available yet.",
+                    onGoToSetup = { selectedSection = TvSection.SETUP },
+                    onSelectEntry = { playingItem = it }
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun TvGuideWithPreviewPane(
+    channels: List<MediaEntry>,
+    epgNow: Map<String, String>,
+    config: IptvConfig,
+    onGoToSetup: () -> Unit,
+    onOpenFullScreen: (MediaEntry) -> Unit
+) {
+    if (channels.isEmpty()) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                "No live channels loaded yet. Enter Xtream or M3U details in Setup.",
+                color = Color(0xFFFBBF24)
+            )
+            Button(onClick = onGoToSetup) {
+                Text("Go to IPTV & EPG Setup")
+            }
+        }
+        return
+    }
+
+    val categories = remember(channels) {
+        listOf("All (${channels.size})") + channels.map { it.category }.distinct()
+    }
+    var selectedCategory by remember(categories) { mutableStateOf(categories.first()) }
+
+    val filtered = remember(channels, selectedCategory) {
+        if (selectedCategory.startsWith("All (")) channels
+        else channels.filter { it.category == selectedCategory }
+    }
+
+    var previewChannel by remember(filtered) { mutableStateOf(filtered.firstOrNull()) }
+    var previewError by remember(previewChannel) { mutableStateOf<String?>(null) }
+
+    val context = LocalContext.current
+    val previewPlayer = remember(previewChannel?.streamUrl, config.bufferSeconds, config.maxHeightPx) {
+        val url = previewChannel?.streamUrl?.trim().orEmpty()
+        if (url.isBlank()) {
+            null
+        } else {
+            runCatching {
+                val bufferMs = (config.bufferSeconds * 1000).coerceIn(5000, 40000)
+                val loadControl = DefaultLoadControl.Builder()
+                    .setBufferDurationsMs(bufferMs, bufferMs * 2, 1500, 2500)
+                    .build()
+
+                ExoPlayer.Builder(context)
+                    .setLoadControl(loadControl)
+                    .build()
+                    .apply {
+                        trackSelectionParameters = trackSelectionParameters
+                            .buildUpon()
+                            .setMaxVideoSize(1280, config.maxHeightPx.coerceAtMost(1080))
+                            .build()
+                        playWhenReady = true
+                        addListener(object : Player.Listener {
+                            override fun onPlayerError(error: PlaybackException) {
+                                previewError = error.errorCodeName
+                            }
+                        })
+                        setMediaItem(MediaItem.fromUri(Uri.parse(url)))
+                        prepare()
+                    }
+            }.getOrNull()
+        }
+    }
+
+    DisposableEffect(previewPlayer) {
+        onDispose {
+            runCatching {
+                previewPlayer?.stop()
+                previewPlayer?.release()
+            }
+        }
+    }
+
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier.fillMaxSize()
+    ) {
+        // Left: Categories
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+                .width(195.dp)
+                .fillMaxHeight()
+        ) {
+            items(categories) { cat ->
+                val active = cat == selectedCategory
+                var focused by remember { mutableStateOf(false) }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onFocusChanged { focused = it.isFocused }
+                        .focusable()
+                        .background(
+                            when {
+                                active -> Color(0xFFD946EF)
+                                focused -> Color(0xFF4C1D95)
+                                else -> Color(0xFF210D44)
+                            },
+                            RoundedCornerShape(8.dp)
+                        )
+                        .border(
+                            width = if (focused) 2.dp else 0.dp,
+                            color = Color(0xFF38BDF8),
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                        .clickable { selectedCategory = cat }
+                        .padding(horizontal = 10.dp, vertical = 9.dp)
+                ) {
+                    Text(
+                        text = cat,
+                        color = Color.White,
+                        fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+
+        // Middle: Channel + EPG Guide List
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+        ) {
+            items(filtered.take(250)) { entry ->
+                var focused by remember { mutableStateOf(false) }
+                val isPreviewing = previewChannel?.id == entry.id
+                val currentProgram = epgNow[entry.epgId]
+
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = when {
+                            focused -> Color(0xFF3B1976)
+                            isPreviewing -> Color(0xFF2D145C)
+                            else -> Color(0xFF24104A)
+                        }
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onFocusChanged { state ->
+                            focused = state.isFocused
+                            if (state.isFocused) {
+                                previewChannel = entry
+                            }
+                        }
+                        .focusable()
+                        .border(
+                            width = if (focused) 2.dp else if (isPreviewing) 1.5.dp else 1.dp,
+                            color = if (focused) Color(0xFF38BDF8) else if (isPreviewing) Color(0xFFD946EF) else Color(0xFF4C1D95),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                        .clickable {
+                            previewChannel = entry
+                            onOpenFullScreen(entry)
+                        }
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Text(
+                            text = entry.name,
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = currentProgram ?: entry.category,
+                            color = if (currentProgram != null) Color(0xFF4ADE80) else Color(0xFF67E8F9),
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+
+        // Right: Live Preview Window + Now Playing EPG Info
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
+            modifier = Modifier
+                .width(340.dp)
+                .fillMaxHeight()
+        ) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(12.dp)
+            ) {
+                Text(
+                    text = "Live Preview",
+                    color = Color(0xFF38BDF8),
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleSmall
+                )
+
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(190.dp)
+                        .background(Color.Black, RoundedCornerShape(10.dp))
+                        .border(1.dp, Color(0xFF7E22CE), RoundedCornerShape(10.dp))
+                ) {
+                    if (previewPlayer != null && previewError == null) {
+                        AndroidView(
+                            factory = { ctx ->
+                                PlayerView(ctx).apply {
+                                    this.player = previewPlayer
+                                    useController = false
+                                }
+                            },
+                            update = { view -> view.player = previewPlayer },
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(10.dp))
+                        )
+                    } else {
+                        Text(
+                            text = previewError ?: "No stream preview",
+                            color = Color(0xFFCBD5E1),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+
+                val current = previewChannel
+                if (current != null) {
+                    Text(
+                        text = current.name,
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "Now: ${epgNow[current.epgId] ?: "No EPG data for this channel"}",
+                        color = Color(0xFF4ADE80),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "Category: ${current.category}",
+                        color = Color(0xFF67E8F9),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    Spacer(modifier = Modifier.weight(1f))
+
+                    Button(
+                        onClick = { onOpenFullScreen(current) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Watch Full Screen")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CategorizedBrowserPane(
+    items: List<MediaEntry>,
+    epgNow: Map<String, String>,
+    emptyText: String,
+    onGoToSetup: () -> Unit,
+    onSelectEntry: (MediaEntry) -> Unit
+) {
+    if (items.isEmpty()) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(emptyText, color = Color(0xFFFBBF24))
+            Button(onClick = onGoToSetup) {
+                Text("Go to IPTV & EPG Setup")
+            }
+        }
+        return
+    }
+
+    val categories = remember(items) {
+        listOf("All (${items.size})") + items.map { it.category }.distinct()
+    }
+    var selectedCategory by remember(categories) { mutableStateOf(categories.first()) }
+
+    val filtered = remember(items, selectedCategory) {
+        if (selectedCategory.startsWith("All (")) items else items.filter { it.category == selectedCategory }
+    }
+
+    Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+                .width(230.dp)
+                .fillMaxHeight()
+        ) {
+            items(categories) { cat ->
+                val active = cat == selectedCategory
+                var focused by remember { mutableStateOf(false) }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onFocusChanged { focused = it.isFocused }
+                        .focusable()
+                        .background(
+                            when {
+                                active -> Color(0xFFD946EF)
+                                focused -> Color(0xFF4C1D95)
+                                else -> Color(0xFF210D44)
+                            },
+                            RoundedCornerShape(8.dp)
+                        )
+                        .border(
+                            width = if (focused) 2.dp else 0.dp,
+                            color = Color(0xFF38BDF8),
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                        .clickable { selectedCategory = cat }
+                        .padding(horizontal = 12.dp, vertical = 10.dp)
+                ) {
+                    Text(
+                        text = cat,
+                        color = Color.White,
+                        fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+
+        LazyColumn(
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+        ) {
+            items(filtered.take(300)) { entry ->
+                var focused by remember { mutableStateOf(false) }
+                val currentProgram = epgNow[entry.epgId]
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (focused) Color(0xFF3B1976) else Color(0xFF24104A)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onFocusChanged { focused = it.isFocused }
+                        .focusable()
+                        .border(
+                            width = if (focused) 2.dp else 1.dp,
+                            color = if (focused) Color(0xFF38BDF8) else Color(0xFF4C1D95),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                        .clickable { onSelectEntry(entry) }
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(
+                            text = entry.name,
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = currentProgram ?: entry.category,
+                            color = if (currentProgram != null) Color(0xFF4ADE80) else Color(0xFF67E8F9),
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FullScreenPlayerOverlay(
+    entry: MediaEntry,
+    config: IptvConfig,
+    onClose: () -> Unit
+) {
+    val context = LocalContext.current
+    BackHandler { onClose() }
+
+    val player = remember(entry.streamUrl, config.bufferSeconds, config.maxHeightPx) {
+        val bufferMs = (config.bufferSeconds * 1000).coerceIn(5000, 50000)
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(bufferMs, bufferMs * 2, 2000, 3000)
+            .build()
+
+        ExoPlayer.Builder(context)
+            .setLoadControl(loadControl)
+            .build()
+            .apply {
+                trackSelectionParameters = trackSelectionParameters
+                    .buildUpon()
+                    .setMaxVideoSize(3840, config.maxHeightPx)
+                    .build()
+                playWhenReady = true
+                setMediaItem(MediaItem.fromUri(Uri.parse(entry.streamUrl)))
+                prepare()
+            }
+    }
+
+    DisposableEffect(player) {
+        onDispose {
+            runCatching {
+                player.stop()
+                player.release()
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    ) {
+        AndroidView(
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    this.player = player
+                    useController = true
+                }
+            },
+            update = { view -> view.player = player },
+            modifier = Modifier.fillMaxSize()
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(20.dp)
+                .background(Color(0xAA14072B), RoundedCornerShape(10.dp))
+                .padding(horizontal = 14.dp, vertical = 8.dp)
+        ) {
+            Button(onClick = onClose) {
+                Text("← Back")
+            }
+            Text(
+                text = "${entry.name} (${entry.category})",
+                color = Color.White,
+                fontWeight = FontWeight.Bold
+            )
         }
     }
 }
@@ -335,14 +1123,12 @@ private fun IntroVideoOverlay(onFinish: () -> Unit) {
         if (rawResId == 0) {
             null
         } else {
-            try {
+            runCatching {
                 ExoPlayer.Builder(context).build().apply {
                     playWhenReady = true
                     addListener(object : Player.Listener {
                         override fun onPlaybackStateChanged(playbackState: Int) {
-                            if (playbackState == Player.STATE_ENDED) {
-                                onFinish()
-                            }
+                            if (playbackState == Player.STATE_ENDED) onFinish()
                         }
 
                         override fun onPlayerError(error: PlaybackException) {
@@ -353,24 +1139,19 @@ private fun IntroVideoOverlay(onFinish: () -> Unit) {
                     setMediaItem(MediaItem.fromUri(uri))
                     prepare()
                 }
-            } catch (_: Exception) {
-                null
-            }
+            }.getOrNull()
         }
     }
 
     LaunchedEffect(player) {
-        if (player == null) {
-            onFinish()
-        }
+        if (player == null) onFinish()
     }
 
     DisposableEffect(player) {
         onDispose {
-            try {
+            runCatching {
                 player?.stop()
                 player?.release()
-            } catch (_: Exception) {
             }
         }
     }
@@ -423,9 +1204,7 @@ private fun TvInputField(
         singleLine = true,
         visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
         keyboardOptions = KeyboardOptions(imeAction = imeAction),
-        keyboardActions = KeyboardActions(
-            onDone = { keyboardController?.hide() }
-        ),
+        keyboardActions = KeyboardActions(onDone = { keyboardController?.hide() }),
         colors = OutlinedTextFieldDefaults.colors(
             focusedTextColor = Color.White,
             unfocusedTextColor = Color.White,
@@ -436,18 +1215,15 @@ private fun TvInputField(
         ),
         modifier = modifier
             .focusRequester(focusRequester)
-            .onFocusChanged { state ->
-                focused = state.isFocused
-                if (state.isFocused) {
-                    keyboardController?.show()
-                }
-            }
+            .onFocusChanged { focused = it.isFocused }
             .onPreviewKeyEvent { event ->
-                if (
-                    event.type == KeyEventType.KeyDown &&
-                    (event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter)
-                ) {
+                val isSelectKey =
+                    event.key == Key.DirectionCenter ||
+                        event.key == Key.Enter ||
+                        event.key == Key.NumPadEnter
+                if (isSelectKey && event.type == KeyEventType.KeyDown) {
                     focusRequester.requestFocus()
+                } else if (isSelectKey && event.type == KeyEventType.KeyUp) {
                     keyboardController?.show()
                 }
                 false
@@ -463,7 +1239,8 @@ private fun TvInputField(
 @Composable
 private fun SetupAndPlaylistPane(
     config: IptvConfig,
-    channels: List<ChannelItem>,
+    catalog: LoadedCatalog,
+    isLoading: Boolean,
     statusMessage: String,
     onSave: (IptvConfig) -> Unit
 ) {
@@ -482,7 +1259,7 @@ private fun SetupAndPlaylistPane(
         TvInputField(
             value = m3uUrl,
             onValueChange = { m3uUrl = it },
-            label = "M3U / M3U8 Playlist URL",
+            label = "M3U / M3U8 Playlist URL (Optional if using Xtream)",
             modifier = Modifier.fillMaxWidth()
         )
 
@@ -518,6 +1295,7 @@ private fun SetupAndPlaylistPane(
 
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             Button(
+                enabled = !isLoading,
                 onClick = {
                     onSave(
                         config.copy(
@@ -530,79 +1308,29 @@ private fun SetupAndPlaylistPane(
                     )
                 }
             ) {
-                Text("Save & Apply IPTV / EPG")
+                Text(if (isLoading) "Loading Catalog..." else "Save & Apply IPTV / EPG")
             }
             if (statusMessage.isNotBlank()) {
                 Text(statusMessage, color = Color(0xFF4ADE80))
             }
         }
 
+        if (isLoading) {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+
         Text(
-            text = "Configured Streams (${channels.size}):",
+            text = "Summary: ${catalog.live.size} Live Channels, ${catalog.movies.size} Movies, ${catalog.series.size} Series, ${catalog.epgNow.size} Active EPG Shows",
             color = Color.White,
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier.padding(top = 6.dp)
         )
-        channels.forEach { ch ->
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(ch.name, color = Color.White, fontWeight = FontWeight.Bold)
-                    Text(ch.streamUrl, color = Color(0xFFCBD5E1), style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ChannelListPane(
-    section: TvSection,
-    channels: List<ChannelItem>,
-    epgUrl: String,
-    onGoToSetup: () -> Unit
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        if (section == TvSection.GUIDE) {
-            Text(
-                text = if (epgUrl.isBlank()) "No EPG URL set yet." else "Active EPG Source: $epgUrl",
-                color = Color(0xFFE2E8F0)
-            )
-        }
-        if (channels.isEmpty()) {
-            Text("No streams configured yet. Add an M3U URL or Xtream Codes in Setup.", color = Color(0xFFFBBF24))
-            Button(onClick = onGoToSetup) {
-                Text("Go to IPTV & EPG Setup")
-            }
-        } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(channels) { ch ->
-                    Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(12.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(ch.name, color = Color.White, fontWeight = FontWeight.Bold)
-                                Text(ch.group, color = Color(0xFF67E8F9), style = MaterialTheme.typography.bodySmall)
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
 @Composable
 private fun SafeMultiViewPane(
-    channels: List<ChannelItem>,
+    channels: List<MediaEntry>,
     maxHeightPx: Int,
     onGoToSetup: () -> Unit
 ) {
@@ -615,7 +1343,7 @@ private fun SafeMultiViewPane(
 
     if (channels.isEmpty()) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Add at least one stream in Setup before launching Multi-View.", color = Color(0xFFFBBF24))
+            Text("Load channels in Setup before launching Multi-View.", color = Color(0xFFFBBF24))
             Button(onClick = onGoToSetup) {
                 Text("Open Setup")
             }
@@ -662,10 +1390,9 @@ private fun SafeMultiViewPane(
     DisposableEffect(players) {
         onDispose {
             players.forEach { player ->
-                try {
+                runCatching {
                     player?.stop()
                     player?.release()
-                } catch (_: Exception) {
                 }
             }
         }
