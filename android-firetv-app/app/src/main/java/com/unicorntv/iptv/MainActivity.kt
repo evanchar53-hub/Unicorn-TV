@@ -1,6 +1,7 @@
 package com.unicorntv.iptv
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
 import android.util.JsonReader
@@ -37,6 +38,8 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -87,6 +90,8 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 
+private const val DEFAULT_OMDB_API_KEY = "b199483a"
+
 data class PlaylistProfile(
     val id: String = UUID.randomUUID().toString(),
     val name: String = "My IPTV Playlist",
@@ -104,7 +109,7 @@ data class PlaylistProfile(
 data class IptvConfig(
     val playlists: List<PlaylistProfile> = emptyList(),
     val activePlaylistId: String = "",
-    val imdbApiKey: String = "",
+    val imdbApiKey: String = DEFAULT_OMDB_API_KEY,
     val playIntroOnStart: Boolean = true,
     val maxHeightPx: Int = 720,
     val bufferSeconds: Int = 15,
@@ -154,11 +159,14 @@ data class ImDbMetadata(
     val imdbId: String = "",
     val title: String = "",
     val year: String = "",
+    val rated: String = "",
     val rating: String = "",
     val genre: String = "",
     val runtime: String = "",
+    val director: String = "",
     val actors: String = "",
-    val plot: String = ""
+    val plot: String = "",
+    val posterUrl: String = ""
 )
 
 data class LoadedCatalog(
@@ -260,10 +268,12 @@ private fun loadConfig(context: Context): IptvConfig {
         activeId = playlists.first().id
     }
 
+    val savedKey = prefs.getString("imdb_api_key", "")?.trim().orEmpty()
+
     return IptvConfig(
         playlists = playlists,
         activePlaylistId = activeId,
-        imdbApiKey = prefs.getString("imdb_api_key", "") ?: "",
+        imdbApiKey = savedKey.ifEmpty { DEFAULT_OMDB_API_KEY },
         playIntroOnStart = prefs.getBoolean("play_intro", true),
         maxHeightPx = prefs.getInt("max_height_px", 720),
         bufferSeconds = prefs.getInt("buffer_seconds", 15),
@@ -277,7 +287,7 @@ private fun saveConfig(context: Context, config: IptvConfig) {
     prefs.edit()
         .putString("playlists_json", serializePlaylistsJson(config.playlists))
         .putString("active_playlist_id", config.activePlaylistId)
-        .putString("imdb_api_key", config.imdbApiKey.trim())
+        .putString("imdb_api_key", config.imdbApiKey.trim().ifEmpty { DEFAULT_OMDB_API_KEY })
         .putBoolean("play_intro", config.playIntroOnStart)
         .putInt("max_height_px", config.maxHeightPx)
         .putInt("buffer_seconds", config.bufferSeconds)
@@ -347,6 +357,21 @@ private fun httpGetSmallText(urlStr: String, timeoutMs: Int = 20000): String {
     } finally {
         conn.disconnect()
     }
+}
+
+private suspend fun fetchPosterBitmap(urlStr: String): ImageBitmap? = withContext(Dispatchers.IO) {
+    if (urlStr.isBlank() || urlStr == "N/A") return@withContext null
+    runCatching {
+        val conn = openHttpConnection(urlStr, connectTimeoutMs = 8000, readTimeoutMs = 12000)
+        try {
+            if (conn.responseCode !in 200..299) return@runCatching null
+            BufferedInputStream(conn.inputStream, 32768).use { input ->
+                BitmapFactory.decodeStream(input)?.asImageBitmap()
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }.getOrNull()
 }
 
 private fun streamXtreamItems(
@@ -582,9 +607,7 @@ private suspend fun fetchImDbInfo(
     rawTitle: String,
     isSeries: Boolean
 ): ImDbMetadata? = withContext(Dispatchers.IO) {
-    val key = apiKey.trim()
-    if (key.isEmpty()) return@withContext null
-
+    val key = apiKey.trim().ifEmpty { DEFAULT_OMDB_API_KEY }
     val (cleanTitle, year) = cleanTitleAndYear(rawTitle)
     if (cleanTitle.isBlank()) return@withContext null
 
@@ -597,15 +620,19 @@ private suspend fun fetchImDbInfo(
         if (!obj.optString("Response").equals("True", ignoreCase = true)) {
             return@runCatching null
         }
+        val poster = obj.optString("Poster", "").takeIf { it.isNotBlank() && it != "N/A" } ?: ""
         ImDbMetadata(
             imdbId = obj.optString("imdbID", ""),
             title = obj.optString("Title", cleanTitle),
             year = obj.optString("Year", year ?: ""),
+            rated = obj.optString("Rated", ""),
             rating = obj.optString("imdbRating", "N/A"),
             genre = obj.optString("Genre", ""),
             runtime = obj.optString("Runtime", ""),
+            director = obj.optString("Director", ""),
             actors = obj.optString("Actors", ""),
-            plot = obj.optString("Plot", "")
+            plot = obj.optString("Plot", ""),
+            posterUrl = poster
         )
     }.getOrNull()
 }
@@ -820,7 +847,6 @@ fun UnicornTvApp() {
             }
     }
 
-    // Pause background audio when Fire TV minimizes/stops the app; resume when returning to TV/Guide
     DisposableEffect(lifecycleOwner, tvPlayer, isFullScreenTv, selectedSection) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -1003,7 +1029,6 @@ fun UnicornTvApp() {
             .background(nebulaBg)
             .padding(14.dp)
     ) {
-        // Scrollable left rail so all sections including Settings remain accessible on TV
         Column(
             modifier = Modifier
                 .width(74.dp)
@@ -1335,7 +1360,6 @@ private fun SevenDayTvGuidePane(
     var browsedChannel by remember(anchorChannel.id) { mutableStateOf(anchorChannel) }
     var isPaused by remember { mutableStateOf(!player.playWhenReady) }
 
-    // Real 24-hour clock column headers (current hour, +2h, +4h)
     val baseHourMs = remember(nowMs) {
         Calendar.getInstance().apply {
             timeInMillis = nowMs
@@ -2124,24 +2148,25 @@ private fun CategorizedBrowserPane(
     var focusedEntry by remember(filtered) { mutableStateOf(filtered.firstOrNull()) }
     var selectedPreviewEntry by remember(filtered) { mutableStateOf<MediaEntry?>(null) }
     val imdbCache = remember { mutableStateMapOf<String, ImDbMetadata?>() }
+    val posterCache = remember { mutableStateMapOf<String, ImageBitmap?>() }
     var isLoadingImDb by remember { mutableStateOf(false) }
 
     val activeDetailTarget = selectedPreviewEntry ?: focusedEntry
 
     LaunchedEffect(activeDetailTarget?.id, imdbApiKey, isSeries) {
         val active = activeDetailTarget ?: return@LaunchedEffect
-        if (imdbApiKey.isBlank()) {
-            isLoadingImDb = false
-            return@LaunchedEffect
-        }
+        val effectiveKey = imdbApiKey.trim().ifEmpty { DEFAULT_OMDB_API_KEY }
         val cacheKey = "${if (isSeries) "series" else "movie"}_${active.name}"
         if (imdbCache.containsKey(cacheKey)) {
             isLoadingImDb = false
             return@LaunchedEffect
         }
         isLoadingImDb = true
-        val fetched = fetchImDbInfo(imdbApiKey, active.name, isSeries)
+        val fetched = fetchImDbInfo(effectiveKey, active.name, isSeries)
         imdbCache[cacheKey] = fetched
+        if (fetched?.posterUrl?.isNotBlank() == true && !posterCache.containsKey(fetched.posterUrl)) {
+            posterCache[fetched.posterUrl] = fetchPosterBitmap(fetched.posterUrl)
+        }
         isLoadingImDb = false
     }
 
@@ -2262,10 +2287,12 @@ private fun CategorizedBrowserPane(
         if (activeDetailTarget != null) {
             val cacheKey = "${if (isSeries) "series" else "movie"}_${activeDetailTarget.name}"
             val meta = imdbCache[cacheKey]
+            val posterBitmap = meta?.posterUrl?.let { posterCache[it] }
+
             Column(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier
-                    .width(340.dp)
+                    .width(350.dp)
                     .fillMaxHeight()
                     .verticalScroll(rememberScrollState())
             ) {
@@ -2281,7 +2308,7 @@ private fun CategorizedBrowserPane(
                             text = if (selectedPreviewEntry != null) {
                                 if (isSeries) "Series Preview & Info" else "Movie Preview & Info"
                             } else {
-                                if (isSeries) "Series Details" else "Movie Details"
+                                if (isSeries) "IMDb Series Details" else "IMDb Movie Details"
                             },
                             color = Color(0xFF38BDF8),
                             fontWeight = FontWeight.Bold,
@@ -2291,31 +2318,65 @@ private fun CategorizedBrowserPane(
                         if (isLoadingImDb) {
                             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                             Text(
-                                text = "Fetching details for ${activeDetailTarget.name}...",
+                                text = "Fetching IMDb info for ${activeDetailTarget.name}...",
                                 color = Color(0xFFCBD5E1),
                                 style = MaterialTheme.typography.bodySmall
                             )
                         } else if (meta != null) {
-                            Text(
-                                text = "${meta.title} (${meta.year})",
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold
-                            )
-                            if (meta.rating.isNotBlank() && meta.rating != "N/A") {
-                                Text(
-                                    text = "IMDb Rating: ★ ${meta.rating}",
-                                    color = Color(0xFF4ADE80),
-                                    fontWeight = FontWeight.SemiBold,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                if (posterBitmap != null) {
+                                    Image(
+                                        bitmap = posterBitmap,
+                                        contentDescription = meta.title,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier
+                                            .width(92.dp)
+                                            .height(136.dp)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .border(1.dp, Color(0xFF7E22CE), RoundedCornerShape(8.dp))
+                                    )
+                                }
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(
+                                        text = "${meta.title} (${meta.year})",
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    if (meta.rating.isNotBlank() && meta.rating != "N/A") {
+                                        Text(
+                                            text = "IMDb ★ ${meta.rating}/10",
+                                            color = Color(0xFF4ADE80),
+                                            fontWeight = FontWeight.SemiBold,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                    val badgeLine = listOf(meta.rated, meta.runtime)
+                                        .filter { it.isNotBlank() && it != "N/A" }
+                                        .joinToString("  •  ")
+                                    if (badgeLine.isNotBlank()) {
+                                        Text(
+                                            text = badgeLine,
+                                            color = Color(0xFF67E8F9),
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                    if (meta.genre.isNotBlank() && meta.genre != "N/A") {
+                                        Text(
+                                            text = meta.genre,
+                                            color = Color(0xFFE2E8F0),
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                }
                             }
-                            val specLine = listOf(meta.genre, meta.runtime, meta.imdbId)
-                                .filter { it.isNotBlank() && it != "N/A" }
-                                .joinToString("  •  ")
-                            if (specLine.isNotBlank()) {
+
+                            if (meta.director.isNotBlank() && meta.director != "N/A") {
                                 Text(
-                                    text = specLine,
-                                    color = Color(0xFF67E8F9),
+                                    text = "Director: ${meta.director}",
+                                    color = Color(0xFFCBD5E1),
                                     style = MaterialTheme.typography.bodySmall
                                 )
                             }
@@ -2345,11 +2406,7 @@ private fun CategorizedBrowserPane(
                                 style = MaterialTheme.typography.bodySmall
                             )
                             val fallbackPlot = activeDetailTarget.plot.ifBlank {
-                                if (imdbApiKey.isBlank()) {
-                                    "Click Play below to start playback, or add an OMDb API key in Settings for ratings, cast, and plot."
-                                } else {
-                                    "No extra IMDb entry found for this title. Click Play below to start."
-                                }
+                                "No matching IMDb record found for this title. Tap Play below to start playback."
                             }
                             Text(
                                 text = fallbackPlot,
