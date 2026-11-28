@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.util.JsonReader
 import android.util.JsonToken
 import android.util.Xml
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -44,6 +45,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -53,6 +55,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -168,6 +172,7 @@ data class LoadedCatalog(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContent {
             UnicornTvApp()
         }
@@ -402,6 +407,7 @@ private fun readJsonArrayItems(
         var catNameRaw = ""
         var epgId = ""
         var ext = "mp4"
+        var plot = ""
 
         reader.beginObject()
         while (reader.hasNext()) {
@@ -418,6 +424,7 @@ private fun readJsonArrayItems(
                 "category_id" -> catId = readScalarAsString(reader)
                 "category_name" -> catNameRaw = readScalarAsString(reader)
                 "epg_channel_id" -> epgId = readScalarAsString(reader)
+                "plot" -> plot = readScalarAsString(reader)
                 "container_extension" -> {
                     val v = readScalarAsString(reader)
                     if (v.isNotBlank()) ext = v
@@ -455,7 +462,8 @@ private fun readJsonArrayItems(
                 category = category,
                 streamUrl = url,
                 epgId = epgId,
-                kind = kind
+                kind = kind,
+                plot = plot
             )
         )
     }
@@ -774,6 +782,7 @@ private enum class TvSection(val title: String, val icon: ImageVector) {
 @Composable
 fun UnicornTvApp() {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     var config by remember { mutableStateOf(loadConfig(context)) }
     var showIntro by remember { mutableStateOf(config.playIntroOnStart) }
@@ -809,6 +818,30 @@ fun UnicornTvApp() {
                     .build()
                 playWhenReady = true
             }
+    }
+
+    // Pause background audio when Fire TV minimizes/stops the app; resume when returning to TV/Guide
+    DisposableEffect(lifecycleOwner, tvPlayer, isFullScreenTv, selectedSection) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    if (tvPlayer.isPlaying) {
+                        tvPlayer.pause()
+                    }
+                }
+                Lifecycle.Event.ON_START -> {
+                    if (watchingChannel != null && (isFullScreenTv || selectedSection == TvSection.GUIDE)) {
+                        tvPlayer.playWhenReady = true
+                        tvPlayer.play()
+                    }
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
     fun startStreamRecording(channelName: String, programTitle: String, streamUrl: String) {
@@ -968,28 +1001,30 @@ fun UnicornTvApp() {
         modifier = Modifier
             .fillMaxSize()
             .background(nebulaBg)
-            .padding(16.dp)
+            .padding(14.dp)
     ) {
+        // Scrollable left rail so all sections including Settings remain accessible on TV
         Column(
             modifier = Modifier
-                .width(76.dp)
-                .fillMaxHeight(),
+                .width(74.dp)
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            verticalArrangement = Arrangement.spacedBy(7.dp)
         ) {
             BrandLogoBadge()
             Text(
                 text = "UTV",
                 color = Color(0xFF38BDF8),
                 fontWeight = FontWeight.ExtraBold,
-                style = MaterialTheme.typography.titleMedium
+                style = MaterialTheme.typography.titleSmall
             )
             TvSection.entries.forEach { section ->
                 val isSelected = selectedSection == section
                 var isFocused by remember { mutableStateOf(false) }
                 Box(
                     modifier = Modifier
-                        .size(46.dp)
+                        .size(44.dp)
                         .onFocusChanged { isFocused = it.isFocused }
                         .focusable()
                         .background(
@@ -998,12 +1033,12 @@ fun UnicornTvApp() {
                                 isFocused -> Color(0xFF4C1D95)
                                 else -> Color(0xFF220E47)
                             },
-                            RoundedCornerShape(12.dp)
+                            RoundedCornerShape(11.dp)
                         )
                         .border(
                             width = if (isFocused || isSelected) 2.dp else 1.dp,
                             color = if (isFocused) Color(0xFF38BDF8) else Color(0xFF7E22CE),
-                            shape = RoundedCornerShape(12.dp)
+                            shape = RoundedCornerShape(11.dp)
                         )
                         .clickable { selectedSection = section },
                     contentAlignment = Alignment.Center
@@ -1011,13 +1046,14 @@ fun UnicornTvApp() {
                     Icon(
                         imageVector = section.icon,
                         contentDescription = section.title,
-                        tint = Color.White
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp)
                     )
                 }
             }
         }
 
-        Spacer(modifier = Modifier.width(20.dp))
+        Spacer(modifier = Modifier.width(18.dp))
 
         Column(
             modifier = Modifier
@@ -1111,7 +1147,7 @@ fun UnicornTvApp() {
                     isSeries = false,
                     emptyText = "No VOD movies loaded yet. Check Setup or update your active playlist.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onSelectEntry = { playEntry(it, fullScreen = true) }
+                    onPlayEntry = { playEntry(it, fullScreen = true) }
                 )
 
                 TvSection.SERIES -> CategorizedBrowserPane(
@@ -1120,7 +1156,7 @@ fun UnicornTvApp() {
                     isSeries = true,
                     emptyText = "No TV series loaded yet. Add a playlist in Setup.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onSelectEntry = { seriesItem ->
+                    onPlayEntry = { seriesItem ->
                         scope.launch {
                             val epUrl = if (seriesItem.streamUrl.contains("get_series_info")) {
                                 resolveFirstSeriesEpisodeUrl(seriesItem.streamUrl)
@@ -1206,7 +1242,7 @@ fun UnicornTvApp() {
                     isSeries = false,
                     emptyText = "No channels available yet.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onSelectEntry = { playEntry(it, fullScreen = true) }
+                    onPlayEntry = { playEntry(it, fullScreen = true) }
                 )
             }
         }
@@ -1299,6 +1335,7 @@ private fun SevenDayTvGuidePane(
     var browsedChannel by remember(anchorChannel.id) { mutableStateOf(anchorChannel) }
     var isPaused by remember { mutableStateOf(!player.playWhenReady) }
 
+    // Real 24-hour clock column headers (current hour, +2h, +4h)
     val baseHourMs = remember(nowMs) {
         Calendar.getInstance().apply {
             timeInMillis = nowMs
@@ -2059,7 +2096,7 @@ private fun CategorizedBrowserPane(
     isSeries: Boolean,
     emptyText: String,
     onGoToSetup: () -> Unit,
-    onSelectEntry: (MediaEntry) -> Unit
+    onPlayEntry: (MediaEntry) -> Unit
 ) {
     if (items.isEmpty()) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -2085,11 +2122,14 @@ private fun CategorizedBrowserPane(
     }
 
     var focusedEntry by remember(filtered) { mutableStateOf(filtered.firstOrNull()) }
+    var selectedPreviewEntry by remember(filtered) { mutableStateOf<MediaEntry?>(null) }
     val imdbCache = remember { mutableStateMapOf<String, ImDbMetadata?>() }
     var isLoadingImDb by remember { mutableStateOf(false) }
 
-    LaunchedEffect(focusedEntry?.id, imdbApiKey, isSeries) {
-        val active = focusedEntry ?: return@LaunchedEffect
+    val activeDetailTarget = selectedPreviewEntry ?: focusedEntry
+
+    LaunchedEffect(activeDetailTarget?.id, imdbApiKey, isSeries) {
+        val active = activeDetailTarget ?: return@LaunchedEffect
         if (imdbApiKey.isBlank()) {
             isLoadingImDb = false
             return@LaunchedEffect
@@ -2133,7 +2173,10 @@ private fun CategorizedBrowserPane(
                             color = Color(0xFF38BDF8),
                             shape = RoundedCornerShape(8.dp)
                         )
-                        .clickable { selectedCategory = cat }
+                        .clickable {
+                            selectedPreviewEntry = null
+                            selectedCategory = cat
+                        }
                         .padding(horizontal = 12.dp, vertical = 10.dp)
                 ) {
                     Text(
@@ -2167,9 +2210,14 @@ private fun CategorizedBrowserPane(
             ) {
                 items(filtered.take(500)) { entry ->
                     var focused by remember { mutableStateOf(false) }
+                    val isClickedPreview = selectedPreviewEntry?.id == entry.id
                     Card(
                         colors = CardDefaults.cardColors(
-                            containerColor = if (focused) Color(0xFF3B1976) else Color(0xFF24104A)
+                            containerColor = when {
+                                focused -> Color(0xFF3B1976)
+                                isClickedPreview -> Color(0xFF2D145C)
+                                else -> Color(0xFF24104A)
+                            }
                         ),
                         modifier = Modifier
                             .fillMaxWidth()
@@ -2181,13 +2229,13 @@ private fun CategorizedBrowserPane(
                             }
                             .focusable()
                             .border(
-                                width = if (focused) 2.dp else 1.dp,
-                                color = if (focused) Color(0xFF38BDF8) else Color(0xFF4C1D95),
+                                width = if (focused || isClickedPreview) 2.dp else 1.dp,
+                                color = if (focused) Color(0xFF38BDF8) else if (isClickedPreview) Color(0xFFD946EF) else Color(0xFF4C1D95),
                                 shape = RoundedCornerShape(10.dp)
                             )
                             .clickable {
                                 focusedEntry = entry
-                                onSelectEntry(entry)
+                                selectedPreviewEntry = entry
                             }
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
@@ -2211,15 +2259,15 @@ private fun CategorizedBrowserPane(
             }
         }
 
-        val currentFocused = focusedEntry
-        if (currentFocused != null && imdbApiKey.isNotBlank()) {
-            val cacheKey = "${if (isSeries) "series" else "movie"}_${currentFocused.name}"
+        if (activeDetailTarget != null) {
+            val cacheKey = "${if (isSeries) "series" else "movie"}_${activeDetailTarget.name}"
             val meta = imdbCache[cacheKey]
             Column(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier
-                    .width(320.dp)
+                    .width(340.dp)
                     .fillMaxHeight()
+                    .verticalScroll(rememberScrollState())
             ) {
                 Card(
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
@@ -2230,15 +2278,20 @@ private fun CategorizedBrowserPane(
                         modifier = Modifier.padding(14.dp)
                     ) {
                         Text(
-                            text = if (isSeries) "IMDb Series Details" else "IMDb Movie Details",
+                            text = if (selectedPreviewEntry != null) {
+                                if (isSeries) "Series Preview & Info" else "Movie Preview & Info"
+                            } else {
+                                if (isSeries) "Series Details" else "Movie Details"
+                            },
                             color = Color(0xFF38BDF8),
                             fontWeight = FontWeight.Bold,
                             style = MaterialTheme.typography.titleSmall
                         )
+
                         if (isLoadingImDb) {
                             LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                             Text(
-                                text = "Looking up ${currentFocused.name}...",
+                                text = "Fetching details for ${activeDetailTarget.name}...",
                                 color = Color(0xFFCBD5E1),
                                 style = MaterialTheme.typography.bodySmall
                             )
@@ -2270,38 +2323,59 @@ private fun CategorizedBrowserPane(
                                 Text(
                                     text = "Cast: ${meta.actors}",
                                     color = Color(0xFFE2E8F0),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 3,
-                                    overflow = TextOverflow.Ellipsis
+                                    style = MaterialTheme.typography.bodySmall
                                 )
                             }
                             if (meta.plot.isNotBlank() && meta.plot != "N/A") {
                                 Text(
                                     text = meta.plot,
                                     color = Color.White,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 6,
-                                    overflow = TextOverflow.Ellipsis
+                                    style = MaterialTheme.typography.bodySmall
                                 )
                             }
                         } else {
                             Text(
-                                text = currentFocused.name,
+                                text = activeDetailTarget.name,
                                 color = Color.White,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "No matching IMDb entry found for this title.",
-                                color = Color(0xFFCBD5E1),
+                                text = "Category: ${activeDetailTarget.category}",
+                                color = Color(0xFF67E8F9),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            val fallbackPlot = activeDetailTarget.plot.ifBlank {
+                                if (imdbApiKey.isBlank()) {
+                                    "Click Play below to start playback, or add an OMDb API key in Settings for ratings, cast, and plot."
+                                } else {
+                                    "No extra IMDb entry found for this title. Click Play below to start."
+                                }
+                            }
+                            Text(
+                                text = fallbackPlot,
+                                color = Color(0xFFE2E8F0),
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
 
-                        Button(
-                            onClick = { onSelectEntry(currentFocused) },
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text(if (isSeries) "Play Episode 1" else "Play Movie")
+                            Button(
+                                onClick = { onPlayEntry(activeDetailTarget) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(if (isSeries) "▶ Play Ep 1" else "▶ Play")
+                            }
+                            if (selectedPreviewEntry != null) {
+                                Button(
+                                    onClick = { selectedPreviewEntry = null },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B1976))
+                                ) {
+                                    Text("Back")
+                                }
+                            }
                         }
                     }
                 }
@@ -2323,7 +2397,7 @@ private fun BrandLogoBadge() {
             contentDescription = "Unicorn TV Logo",
             contentScale = ContentScale.Crop,
             modifier = Modifier
-                .size(46.dp)
+                .size(44.dp)
                 .clip(CircleShape)
                 .border(2.dp, Color(0xFF38BDF8), CircleShape)
         )
