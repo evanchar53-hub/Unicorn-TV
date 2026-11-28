@@ -16,6 +16,7 @@
         android:banner="@drawable/tv_banner"
         android:icon="@drawable/ic_launcher"
         android:label="Unicorn TV"
+        android:largeHeap="true"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:usesCleartextTraffic="true">
