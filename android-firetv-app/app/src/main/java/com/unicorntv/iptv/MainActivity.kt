@@ -61,6 +61,7 @@ import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -68,7 +69,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
 import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.BufferedReader
+import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
@@ -107,7 +111,7 @@ data class IptvConfig(
         get() = playlists.firstOrNull { it.id == activePlaylistId } ?: playlists.firstOrNull()
 }
 
-enum class MediaKind { LIVE, MOVIE, SERIES }
+enum class MediaKind { LIVE, MOVIE, SERIES, DVR }
 
 data class MediaEntry(
     val id: String,
@@ -123,6 +127,23 @@ data class EpgSlot(
     val title: String,
     val startMs: Long,
     val stopMs: Long
+)
+
+data class ScheduledRecording(
+    val id: String = UUID.randomUUID().toString(),
+    val channelName: String,
+    val programTitle: String,
+    val streamUrl: String,
+    val startMs: Long,
+    val durationMinutes: Int = 60
+)
+
+data class DvrRecordingItem(
+    val title: String,
+    val channelName: String,
+    val filePath: String,
+    val sizeMb: Long,
+    val recordedAtMs: Long
 )
 
 data class ImDbMetadata(
@@ -260,6 +281,30 @@ private fun saveConfig(context: Context, config: IptvConfig) {
         .apply()
 }
 
+private fun getDvrDir(context: Context): File {
+    val base = context.getExternalFilesDir("dvr_recordings") ?: File(context.filesDir, "dvr_recordings")
+    if (!base.exists()) base.mkdirs()
+    return base
+}
+
+private fun listSavedRecordings(context: Context): List<DvrRecordingItem> {
+    val dir = getDvrDir(context)
+    val files = dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() }.orEmpty()
+    return files.map { file ->
+        val cleanBase = file.nameWithoutExtension
+        val parts = cleanBase.split("___", limit = 2)
+        val chName = parts.getOrNull(0)?.replace('_', ' ') ?: "Live TV"
+        val title = parts.getOrNull(1)?.replace('_', ' ') ?: cleanBase
+        DvrRecordingItem(
+            title = title,
+            channelName = chName,
+            filePath = file.absolutePath,
+            sizeMb = (file.length() / (1024L * 1024L)).coerceAtLeast(0L),
+            recordedAtMs = file.lastModified()
+        )
+    }
+}
+
 private fun isDailyUpdateDue(profile: PlaylistProfile, nowMs: Long = System.currentTimeMillis()): Boolean {
     if (!profile.autoDailyUpdate) return false
     val cal = Calendar.getInstance().apply {
@@ -299,6 +344,7 @@ private fun httpGetSmallText(urlStr: String, timeoutMs: Int = 20000): String {
     }
 }
 
+// Streams full Xtream JSON arrays without item caps using android.util.JsonReader
 private fun streamXtreamItems(
     urlStr: String,
     catMap: Map<String, String>,
@@ -306,8 +352,7 @@ private fun streamXtreamItems(
     base: String,
     user: String,
     pass: String,
-    outList: MutableList<MediaEntry>,
-    maxItems: Int = 15000
+    outList: MutableList<MediaEntry>
 ) {
     val conn = openHttpConnection(urlStr, connectTimeoutMs = 20000, readTimeoutMs = 120000)
     try {
@@ -320,14 +365,14 @@ private fun streamXtreamItems(
             while (reader.hasNext()) {
                 val key = reader.nextName()
                 if (reader.peek() == JsonToken.BEGIN_ARRAY && (key == "streams" || key == "vod_streams" || key == "series" || key == "data")) {
-                    readJsonArrayItems(reader, catMap, kind, base, user, pass, outList, maxItems)
+                    readJsonArrayItems(reader, catMap, kind, base, user, pass, outList)
                 } else {
                     reader.skipValue()
                 }
             }
             reader.endObject()
         } else if (reader.peek() == JsonToken.BEGIN_ARRAY) {
-            readJsonArrayItems(reader, catMap, kind, base, user, pass, outList, maxItems)
+            readJsonArrayItems(reader, catMap, kind, base, user, pass, outList)
         }
         reader.close()
     } finally {
@@ -342,15 +387,10 @@ private fun readJsonArrayItems(
     base: String,
     user: String,
     pass: String,
-    outList: MutableList<MediaEntry>,
-    maxItems: Int
+    outList: MutableList<MediaEntry>
 ) {
     reader.beginArray()
     while (reader.hasNext()) {
-        if (outList.size >= maxItems) {
-            reader.skipValue()
-            continue
-        }
         if (reader.peek() != JsonToken.BEGIN_OBJECT) {
             reader.skipValue()
             continue
@@ -433,14 +473,14 @@ private fun readScalarAsString(reader: JsonReader): String {
     }
 }
 
+// Streams full M3U playlist line-by-line without item caps
 private fun streamM3uFromUrl(
     m3uUrl: String,
     liveOut: MutableList<MediaEntry>,
     movieOut: MutableList<MediaEntry>,
-    seriesOut: MutableList<MediaEntry>,
-    maxPerKind: Int = 25000
+    seriesOut: MutableList<MediaEntry>
 ) {
-    val conn = openHttpConnection(m3uUrl, connectTimeoutMs = 20000, readTimeoutMs = 90000)
+    val conn = openHttpConnection(m3uUrl, connectTimeoutMs = 20000, readTimeoutMs = 120000)
     try {
         val code = conn.responseCode
         if (code !in 200..299) throw IllegalStateException("HTTP $code")
@@ -471,18 +511,16 @@ private fun streamM3uFromUrl(
                         MediaKind.MOVIE -> movieOut
                         MediaKind.SERIES -> seriesOut
                     }
-                    if (target.size < maxPerKind) {
-                        target.add(
-                            MediaEntry(
-                                id = "m3u_$index",
-                                name = pendingName.ifBlank { "Channel $index" },
-                                category = pendingGroup,
-                                streamUrl = line,
-                                epgId = pendingTvgId,
-                                kind = kind
-                            )
+                    target.add(
+                        MediaEntry(
+                            id = "m3u_$index",
+                            name = pendingName.ifBlank { "Channel $index" },
+                            category = pendingGroup,
+                            streamUrl = line,
+                            epgId = pendingTvgId,
+                            kind = kind
                         )
-                    }
+                    )
                     pendingName = ""
                 }
             }
@@ -583,7 +621,7 @@ private suspend fun fetchCatalogForPlaylist(
             val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
             val apiBase = "$base/player_api.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
 
-            onProgress("[${playlist.name}] Streaming Live TV channels...")
+            onProgress("[${playlist.name}] Streaming all Live TV channels...")
             val liveCatMap = parseCategoryMap(
                 runCatching { httpGetSmallText("$apiBase&action=get_live_categories", timeoutMs = 30000) }.getOrDefault("[]")
             )
@@ -591,7 +629,7 @@ private suspend fun fetchCatalogForPlaylist(
                 streamXtreamItems("$apiBase&action=get_live_streams", liveCatMap, MediaKind.LIVE, base, user, pass, liveList)
             }.onFailure { warnings.add("Live: ${it.message}") }
 
-            onProgress("[${playlist.name}] Streaming VOD Movies...")
+            onProgress("[${playlist.name}] Streaming all VOD Movies...")
             val vodCatMap = parseCategoryMap(
                 runCatching { httpGetSmallText("$apiBase&action=get_vod_categories", timeoutMs = 30000) }.getOrDefault("[]")
             )
@@ -599,7 +637,7 @@ private suspend fun fetchCatalogForPlaylist(
                 streamXtreamItems("$apiBase&action=get_vod_streams", vodCatMap, MediaKind.MOVIE, base, user, pass, movieList)
             }.onFailure { warnings.add("VOD: ${it.message}") }
 
-            onProgress("[${playlist.name}] Streaming TV Series...")
+            onProgress("[${playlist.name}] Streaming all TV Series...")
             val serCatMap = parseCategoryMap(
                 runCatching { httpGetSmallText("$apiBase&action=get_series_categories", timeoutMs = 30000) }.getOrDefault("[]")
             )
@@ -607,7 +645,7 @@ private suspend fun fetchCatalogForPlaylist(
                 streamXtreamItems("$apiBase&action=get_series", serCatMap, MediaKind.SERIES, base, user, pass, seriesList)
             }.onFailure { warnings.add("Series: ${it.message}") }
         } else if (playlist.m3uUrl.isNotBlank()) {
-            onProgress("[${playlist.name}] Streaming M3U playlist...")
+            onProgress("[${playlist.name}] Streaming full M3U playlist...")
             runCatching {
                 streamM3uFromUrl(playlist.m3uUrl.trim(), liveList, movieList, seriesList)
             }.onFailure { warnings.add("M3U: ${it.message}") }
@@ -641,7 +679,6 @@ private suspend fun fetchCatalogForPlaylist(
     )
 }
 
-// 7-day lookahead XMLTV EPG parser (from 2 hours ago to 7 days ahead)
 private fun fetchEpgTimelineMap(epgUrl: String): Map<String, List<EpgSlot>> {
     val nowMs = System.currentTimeMillis()
     val windowStart = nowMs - 2L * 3600_000L
@@ -686,7 +723,7 @@ private fun fetchEpgTimelineMap(epgUrl: String): Map<String, List<EpgSlot>> {
                         if (parser.name == "programme" && inProgramme) {
                             if (progChannel.isNotBlank() && progTitle.isNotBlank() && progStop >= windowStart && progStart <= windowEnd) {
                                 val list = grouped.getOrPut(progChannel) { mutableListOf() }
-                                if (list.size < 48) {
+                                if (list.size < 96) {
                                     list.add(EpgSlot(progTitle, progStart, progStop))
                                 }
                             }
@@ -729,6 +766,7 @@ private enum class TvSection(val title: String, val icon: ImageVector) {
     MULTIVIEW("Multi-View", Icons.Default.GridView),
     MOVIES("Movies (VOD)", Icons.Default.Movie),
     SERIES("Series", Icons.Default.Tv),
+    DVR("DVR & Recordings", Icons.Default.FiberManualRecord),
     SPEED_OPTIMIZER("Speed Optimizer", Icons.Default.Speed),
     SETTINGS("Settings", Icons.Default.Settings)
 }
@@ -744,11 +782,17 @@ fun UnicornTvApp() {
     var isLoadingCatalog by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
 
-    var activeChannel by remember { mutableStateOf<MediaEntry?>(null) }
+    // watchingChannel stays set to the channel currently tuned in playback; browsedChannel tracks surfing
+    var watchingChannel by remember { mutableStateOf<MediaEntry?>(null) }
     var isFullScreenTv by remember { mutableStateOf(false) }
     var streamError by remember { mutableStateOf<String?>(null) }
 
-    // Single persistent ExoPlayer so returning from full-screen to TV Guide keeps the exact channel playing
+    // Active DVR recording state
+    var recordingJob by remember { mutableStateOf<Job?>(null) }
+    var activeRecordingLabel by remember { mutableStateOf<String?>(null) }
+    var recordings by remember { mutableStateOf(listSavedRecordings(context)) }
+    val scheduledRecordings = remember { mutableStateListOf<ScheduledRecording>() }
+
     val tvPlayer = remember(config.bufferSeconds, config.maxHeightPx) {
         val bufferMs = (config.bufferSeconds * 1000).coerceIn(5000, 40000)
         val loadControl = DefaultLoadControl.Builder()
@@ -769,6 +813,52 @@ fun UnicornTvApp() {
             }
     }
 
+    fun startStreamRecording(channelName: String, programTitle: String, streamUrl: String) {
+        if (streamUrl.isBlank()) return
+        recordingJob?.cancel()
+        val safeChannel = channelName.replace(Regex("""[^A-Za-z0-9._ -]"""), "_").replace(' ', '_').take(32)
+        val safeTitle = programTitle.replace(Regex("""[^A-Za-z0-9._ -]"""), "_").replace(' ', '_').take(40)
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val outFile = File(getDvrDir(context), "${safeChannel}___${safeTitle}_$stamp.ts")
+
+        activeRecordingLabel = "$channelName — $programTitle"
+        statusMessage = "Recording started: ${outFile.name}"
+
+        recordingJob = scope.launch(Dispatchers.IO) {
+            var conn: HttpURLConnection? = null
+            try {
+                conn = openHttpConnection(streamUrl, connectTimeoutMs = 15000, readTimeoutMs = 30000)
+                BufferedInputStream(conn.inputStream, 65536).use { input ->
+                    BufferedOutputStream(FileOutputStream(outFile), 65536).use { output ->
+                        val buf = ByteArray(16 * 1024)
+                        while (true) {
+                            val read = input.read(buf)
+                            if (read == -1) break
+                            output.write(buf, 0, read)
+                        }
+                        output.flush()
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                conn?.disconnect()
+                withContext(Dispatchers.Main) {
+                    activeRecordingLabel = null
+                    recordingJob = null
+                    recordings = listSavedRecordings(context)
+                    statusMessage = "DVR saved: ${outFile.name}"
+                }
+            }
+        }
+    }
+
+    fun stopStreamRecording() {
+        recordingJob?.cancel()
+        recordingJob = null
+        activeRecordingLabel = null
+        recordings = listSavedRecordings(context)
+    }
+
     DisposableEffect(tvPlayer) {
         val listener = object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
@@ -777,6 +867,7 @@ fun UnicornTvApp() {
         }
         tvPlayer.addListener(listener)
         onDispose {
+            recordingJob?.cancel()
             tvPlayer.removeListener(listener)
             runCatching {
                 tvPlayer.stop()
@@ -785,11 +876,11 @@ fun UnicornTvApp() {
         }
     }
 
-    fun tuneToEntry(entry: MediaEntry, fullScreen: Boolean) {
+    fun playEntry(entry: MediaEntry, fullScreen: Boolean) {
         streamError = null
         val url = entry.streamUrl.trim()
-        val isDifferent = activeChannel?.streamUrl != url
-        activeChannel = entry
+        val isDifferent = watchingChannel?.streamUrl != url
+        watchingChannel = entry
         if (url.isNotBlank() && isDifferent) {
             tvPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(url)))
             tvPlayer.prepare()
@@ -818,10 +909,10 @@ fun UnicornTvApp() {
             config = updatedCfg
             saveConfig(context, updatedCfg)
 
-            if (activeChannel == null) {
+            if (watchingChannel == null) {
                 val firstLive = loaded.live.firstOrNull { !it.name.startsWith("#") } ?: loaded.live.firstOrNull()
                 if (firstLive != null) {
-                    tuneToEntry(firstLive, fullScreen = false)
+                    playEntry(firstLive, fullScreen = false)
                 }
             }
             statusMessage = if (loaded.error != null) {
@@ -839,12 +930,18 @@ fun UnicornTvApp() {
         }
     }
 
-    LaunchedEffect(config.activePlaylistId, config.playlists) {
+    LaunchedEffect(config.activePlaylistId, config.playlists, scheduledRecordings.size) {
         while (true) {
-            delay(60_000L)
+            delay(30_000L)
+            val nowMs = System.currentTimeMillis()
             val active = config.activePlaylist
-            if (!isLoadingCatalog && active != null && isDailyUpdateDue(active)) {
+            if (!isLoadingCatalog && active != null && isDailyUpdateDue(active, nowMs)) {
                 loadPlaylistNow(active, config)
+            }
+            val dueRec = scheduledRecordings.firstOrNull { nowMs >= it.startMs }
+            if (dueRec != null && activeRecordingLabel == null) {
+                scheduledRecordings.remove(dueRec)
+                startStreamRecording(dueRec.channelName, dueRec.programTitle, dueRec.streamUrl)
             }
         }
     }
@@ -854,7 +951,7 @@ fun UnicornTvApp() {
         return
     }
 
-    if (isFullScreenTv && activeChannel != null) {
+    if (isFullScreenTv && watchingChannel != null) {
         FullScreenCleanTvOverlay(
             player = tvPlayer,
             onBackToGuide = {
@@ -880,7 +977,7 @@ fun UnicornTvApp() {
                 .width(76.dp)
                 .fillMaxHeight(),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             BrandLogoBadge()
             Text(
@@ -894,7 +991,7 @@ fun UnicornTvApp() {
                 var isFocused by remember { mutableStateOf(false) }
                 Box(
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(46.dp)
                         .onFocusChanged { isFocused = it.isFocused }
                         .focusable()
                         .background(
@@ -987,12 +1084,27 @@ fun UnicornTvApp() {
                 TvSection.GUIDE -> SevenDayTvGuidePane(
                     channels = catalog.live,
                     epgTimeline = catalog.epgTimeline,
-                    activeChannel = activeChannel,
+                    watchingChannel = watchingChannel,
                     player = tvPlayer,
                     previewError = streamError,
-                    onTuneChannel = { ch -> tuneToEntry(ch, fullScreen = false) },
+                    activeRecordingLabel = activeRecordingLabel,
+                    onStartRecord = { ch, progTitle ->
+                        startStreamRecording(ch.name, progTitle, ch.streamUrl)
+                    },
+                    onStopRecord = { stopStreamRecording() },
+                    onScheduleRecord = { ch, slot ->
+                        scheduledRecordings.add(
+                            ScheduledRecording(
+                                channelName = ch.name,
+                                programTitle = slot.title,
+                                streamUrl = ch.streamUrl,
+                                startMs = slot.startMs
+                            )
+                        )
+                        statusMessage = "Scheduled DVR: ${slot.title} on ${ch.name}"
+                    },
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onOpenFullScreen = { ch -> tuneToEntry(ch, fullScreen = true) }
+                    onTuneAndWatchFullScreen = { ch -> playEntry(ch, fullScreen = true) }
                 )
 
                 TvSection.MOVIES -> CategorizedBrowserPane(
@@ -1001,7 +1113,7 @@ fun UnicornTvApp() {
                     isSeries = false,
                     emptyText = "No VOD movies loaded yet. Check Setup or update your active playlist.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onSelectEntry = { tuneToEntry(it, fullScreen = true) }
+                    onSelectEntry = { playEntry(it, fullScreen = true) }
                 )
 
                 TvSection.SERIES -> CategorizedBrowserPane(
@@ -1018,11 +1130,38 @@ fun UnicornTvApp() {
                                 seriesItem.streamUrl
                             }
                             if (!epUrl.isNullOrBlank()) {
-                                tuneToEntry(seriesItem.copy(streamUrl = epUrl), fullScreen = true)
+                                playEntry(seriesItem.copy(streamUrl = epUrl), fullScreen = true)
                             } else {
                                 statusMessage = "Could not resolve episode stream for ${seriesItem.name}."
                             }
                         }
+                    }
+                )
+
+                TvSection.DVR -> DvrManagerPane(
+                    channels = catalog.live,
+                    activeRecordingLabel = activeRecordingLabel,
+                    scheduledRecordings = scheduledRecordings,
+                    recordings = recordings,
+                    onStartRecordChannel = { ch ->
+                        startStreamRecording(ch.name, "Manual DVR Capture", ch.streamUrl)
+                    },
+                    onStopRecording = { stopStreamRecording() },
+                    onPlayRecording = { rec ->
+                        playEntry(
+                            MediaEntry(
+                                id = rec.filePath,
+                                name = "${rec.title} (${rec.channelName})",
+                                category = "DVR Recording",
+                                streamUrl = Uri.fromFile(File(rec.filePath)).toString(),
+                                kind = MediaKind.DVR
+                            ),
+                            fullScreen = true
+                        )
+                    },
+                    onDeleteRecording = { rec ->
+                        runCatching { File(rec.filePath).delete() }
+                        recordings = listSavedRecordings(context)
                     }
                 )
 
@@ -1064,12 +1203,12 @@ fun UnicornTvApp() {
                 )
 
                 TvSection.FAVORITES -> CategorizedBrowserPane(
-                    items = catalog.live.take(30),
+                    items = catalog.live.take(300),
                     imdbApiKey = "",
                     isSeries = false,
                     emptyText = "No channels available yet.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onSelectEntry = { tuneToEntry(it, fullScreen = true) }
+                    onSelectEntry = { playEntry(it, fullScreen = true) }
                 )
             }
         }
@@ -1109,12 +1248,15 @@ private fun FullScreenCleanTvOverlay(
 private fun SevenDayTvGuidePane(
     channels: List<MediaEntry>,
     epgTimeline: Map<String, List<EpgSlot>>,
-    activeChannel: MediaEntry?,
+    watchingChannel: MediaEntry?,
     player: ExoPlayer,
     previewError: String?,
-    onTuneChannel: (MediaEntry) -> Unit,
+    activeRecordingLabel: String?,
+    onStartRecord: (MediaEntry, String) -> Unit,
+    onStopRecord: () -> Unit,
+    onScheduleRecord: (MediaEntry, EpgSlot) -> Unit,
     onGoToSetup: () -> Unit,
-    onOpenFullScreen: (MediaEntry) -> Unit
+    onTuneAndWatchFullScreen: (MediaEntry) -> Unit
 ) {
     if (channels.isEmpty()) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1155,12 +1297,30 @@ private fun SevenDayTvGuidePane(
     val time24Fmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
     val current24Time = time24Fmt.format(Date(nowMs))
 
-    val currentPreview = activeChannel ?: channels.first()
+    // Anchor on the currently watching channel; browsedChannel tracks what the user highlights while surfing
+    val anchorChannel = watchingChannel ?: channels.first()
+    var browsedChannel by remember(anchorChannel.id) { mutableStateOf(anchorChannel) }
     var isPaused by remember { mutableStateOf(!player.playWhenReady) }
+
+    // Real 24-hour time window anchors for the 3 schedule columns
+    val baseHourMs = remember(nowMs) {
+        Calendar.getInstance().apply {
+            timeInMillis = nowMs
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+    }
+    val col1StartMs = baseHourMs
+    val col2StartMs = baseHourMs + 2L * 3600_000L
+    val col3StartMs = baseHourMs + 4L * 3600_000L
+    val col1Label = time24Fmt.format(Date(col1StartMs))
+    val col2Label = time24Fmt.format(Date(col2StartMs))
+    val col3Label = time24Fmt.format(Date(col3StartMs))
 
     LaunchedEffect(player) {
         while (true) {
-            isPaused = !player.playWhenReady || player.playbackState == Player.STATE_READY && !player.isPlaying
+            isPaused = !player.playWhenReady || (player.playbackState == Player.STATE_READY && !player.isPlaying)
             delay(500L)
         }
     }
@@ -1183,12 +1343,12 @@ private fun SevenDayTvGuidePane(
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
-        // Top Bar: Live Preview + Rewind / Pause / Live TV Controls + Search (keeps playing)
+        // Top Row: Active Watching Channel Preview + Pause/Rewind/Live/DVR + Search (keeps playing)
         Row(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier
                 .fillMaxWidth()
-                .height(160.dp)
+                .height(165.dp)
         ) {
             Box(
                 contentAlignment = Alignment.Center,
@@ -1197,7 +1357,7 @@ private fun SevenDayTvGuidePane(
                     .fillMaxHeight()
                     .background(Color.Black, RoundedCornerShape(10.dp))
                     .border(2.dp, Color(0xFF38BDF8), RoundedCornerShape(10.dp))
-                    .clickable { onOpenFullScreen(currentPreview) }
+                    .clickable { onTuneAndWatchFullScreen(anchorChannel) }
             ) {
                 if (previewError == null) {
                     AndroidView(
@@ -1227,9 +1387,8 @@ private fun SevenDayTvGuidePane(
                     .weight(1f)
                     .fillMaxHeight()
             ) {
-                val slotsForPreview = epgTimeline[currentPreview.epgId].orEmpty()
-                val slotInDay = slotsForPreview.firstOrNull { it.stopMs >= activeDayRange.first && it.startMs <= activeDayRange.second }
-                    ?: slotsForPreview.firstOrNull()
+                val browsedSlots = epgTimeline[browsedChannel.epgId].orEmpty()
+                val currentBrowsedSlot = browsedSlots.firstOrNull { nowMs in it.startMs..it.stopMs } ?: browsedSlots.firstOrNull()
 
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(
@@ -1238,7 +1397,7 @@ private fun SevenDayTvGuidePane(
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = currentPreview.name,
+                            text = "Watching: ${anchorChannel.name}",
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
@@ -1246,21 +1405,21 @@ private fun SevenDayTvGuidePane(
                             modifier = Modifier.weight(1f)
                         )
                         Text(
-                            text = "24h Clock: $current24Time",
+                            text = "24h: $current24Time",
                             color = Color(0xFF67E8F9),
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(horizontal = 8.dp)
                         )
-                        Button(onClick = { onOpenFullScreen(currentPreview) }) {
-                            Text("Full Screen")
+                        Button(onClick = { onTuneAndWatchFullScreen(browsedChannel) }) {
+                            Text(if (browsedChannel.id == anchorChannel.id) "Full Screen" else "Watch Selected")
                         }
                     }
 
                     Text(
-                        text = if (slotInDay != null) {
-                            "${time24Fmt.format(Date(slotInDay.startMs))}–${time24Fmt.format(Date(slotInDay.stopMs))}  •  ${slotInDay.title}"
+                        text = if (currentBrowsedSlot != null) {
+                            "${browsedChannel.name} • ${time24Fmt.format(Date(currentBrowsedSlot.startMs))}–${time24Fmt.format(Date(currentBrowsedSlot.stopMs))} ${currentBrowsedSlot.title}"
                         } else {
-                            "Category: ${currentPreview.category}"
+                            "Selected: ${browsedChannel.name} (${browsedChannel.category})"
                         },
                         color = Color(0xFF4ADE80),
                         style = MaterialTheme.typography.bodySmall,
@@ -1268,7 +1427,6 @@ private fun SevenDayTvGuidePane(
                         overflow = TextOverflow.Ellipsis
                     )
 
-                    // Rewind (-15s), Pause/Resume, and Live TV controls
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
                             onClick = {
@@ -1305,6 +1463,26 @@ private fun SevenDayTvGuidePane(
                         ) {
                             Text("● Live TV")
                         }
+                        if (activeRecordingLabel != null) {
+                            Button(
+                                onClick = onStopRecord,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB91C1C))
+                            ) {
+                                Text("⏹ Stop DVR")
+                            }
+                        } else {
+                            Button(
+                                onClick = {
+                                    onStartRecord(
+                                        browsedChannel,
+                                        currentBrowsedSlot?.title ?: "Live Capture"
+                                    )
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF991B1B))
+                            ) {
+                                Text("⏺ DVR")
+                            }
+                        }
                     }
                 }
 
@@ -1316,7 +1494,7 @@ private fun SevenDayTvGuidePane(
                     TvInputField(
                         value = searchQuery,
                         onValueChange = { searchQuery = it },
-                        label = "Search Guide (Channel stays playing)",
+                        label = "Search Guide (Watching channel stays playing)",
                         imeAction = ImeAction.Search,
                         modifier = Modifier.weight(1f)
                     )
@@ -1329,7 +1507,7 @@ private fun SevenDayTvGuidePane(
             }
         }
 
-        // 7-Day Lookahead Selector Strip (Today + next 6 days)
+        // 7-Day Lookahead Strip
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
             items(dayOptions) { (offset, label, _) ->
                 val selected = selectedDayOffset == offset
@@ -1345,7 +1523,7 @@ private fun SevenDayTvGuidePane(
             }
         }
 
-        // Bottom: Categories + 24-Hour Time Slot Schedule Grid
+        // Bottom: Categories + 24-Hour Clock Guide Rows
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.weight(1f)) {
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -1396,21 +1574,23 @@ private fun SevenDayTvGuidePane(
                         .padding(horizontal = 10.dp, vertical = 6.dp)
                 ) {
                     Text("Channel", color = Color(0xFF67E8F9), fontWeight = FontWeight.Bold, modifier = Modifier.width(195.dp))
-                    Text("Slot 1 (24h)", color = Color(0xFF4ADE80), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    Text("Slot 2 (24h)", color = Color(0xFF67E8F9), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    Text("Slot 3 (24h)", color = Color(0xFFE2E8F0), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Text(col1Label, color = Color(0xFF4ADE80), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Text(col2Label, color = Color(0xFF67E8F9), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Text(col3Label, color = Color(0xFFE2E8F0), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 }
                 Spacer(modifier = Modifier.height(6.dp))
 
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxSize()) {
-                    items(filtered.take(250)) { entry ->
+                    items(filtered.take(500)) { entry ->
                         var focused by remember { mutableStateOf(false) }
-                        val isWatching = currentPreview.id == entry.id
+                        val isWatching = anchorChannel.id == entry.id
+                        val isBrowsed = browsedChannel.id == entry.id
                         val daySlots = epgTimeline[entry.epgId].orEmpty()
                             .filter { it.stopMs >= activeDayRange.first && it.startMs <= activeDayRange.second }
-                        val s1 = daySlots.getOrNull(0)
-                        val s2 = daySlots.getOrNull(1)
-                        val s3 = daySlots.getOrNull(2)
+
+                        val s1 = daySlots.firstOrNull { col1StartMs in it.startMs..it.stopMs || it.startMs >= col1StartMs } ?: daySlots.getOrNull(0)
+                        val s2 = daySlots.firstOrNull { col2StartMs in it.startMs..it.stopMs || it.startMs >= col2StartMs } ?: daySlots.getOrNull(1)
+                        val s3 = daySlots.firstOrNull { col3StartMs in it.startMs..it.stopMs || it.startMs >= col3StartMs } ?: daySlots.getOrNull(2)
 
                         fun formatSlot(slot: EpgSlot?): String {
                             if (slot == null) return "—"
@@ -1424,7 +1604,7 @@ private fun SevenDayTvGuidePane(
                                 .onFocusChanged { state ->
                                     focused = state.isFocused
                                     if (state.isFocused) {
-                                        onTuneChannel(entry)
+                                        browsedChannel = entry
                                     }
                                 }
                                 .focusable()
@@ -1437,18 +1617,18 @@ private fun SevenDayTvGuidePane(
                                     RoundedCornerShape(8.dp)
                                 )
                                 .border(
-                                    width = if (focused) 2.dp else if (isWatching) 1.5.dp else 1.dp,
+                                    width = if (focused || isBrowsed) 2.dp else if (isWatching) 1.5.dp else 1.dp,
                                     color = if (focused) Color(0xFF38BDF8) else if (isWatching) Color(0xFFD946EF) else Color(0xFF4C1D95),
                                     shape = RoundedCornerShape(8.dp)
                                 )
                                 .clickable {
-                                    onTuneChannel(entry)
-                                    onOpenFullScreen(entry)
+                                    browsedChannel = entry
+                                    onTuneAndWatchFullScreen(entry)
                                 }
                                 .padding(horizontal = 10.dp, vertical = 9.dp)
                         ) {
                             Text(
-                                text = entry.name,
+                                text = "${if (isWatching) "▶ " else ""}${entry.name}",
                                 color = Color.White,
                                 fontWeight = FontWeight.Bold,
                                 maxLines = 1,
@@ -1479,6 +1659,142 @@ private fun SevenDayTvGuidePane(
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.weight(1f)
                             )
+                            if (s1 != null && selectedDayOffset > 0) {
+                                Button(
+                                    onClick = { onScheduleRecord(entry, s1) },
+                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
+                                    modifier = Modifier.padding(start = 6.dp)
+                                ) {
+                                    Text("+DVR", style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DvrManagerPane(
+    channels: List<MediaEntry>,
+    activeRecordingLabel: String?,
+    scheduledRecordings: List<ScheduledRecording>,
+    recordings: List<DvrRecordingItem>,
+    onStartRecordChannel: (MediaEntry) -> Unit,
+    onStopRecording: () -> Unit,
+    onPlayRecording: (DvrRecordingItem) -> Unit,
+    onDeleteRecording: (DvrRecordingItem) -> Unit
+) {
+    val timeFmt = remember { SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()) }
+
+    Column(
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+    ) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.padding(14.dp)
+            ) {
+                Text(
+                    text = "Live DVR Recorder",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.titleMedium
+                )
+                if (activeRecordingLabel != null) {
+                    Text(
+                        text = "● Recording in progress: $activeRecordingLabel",
+                        color = Color(0xFFF87171),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Button(
+                        onClick = onStopRecording,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB91C1C))
+                    ) {
+                        Text("Stop Recording")
+                    }
+                } else {
+                    val sampleChannels = channels.filter { !it.name.trim().startsWith("#") }.take(6)
+                    if (sampleChannels.isEmpty()) {
+                        Text("Load Live TV channels in Setup to record streams.", color = Color(0xFFCBD5E1))
+                    } else {
+                        Text("Quick Record a Live Channel:", color = Color(0xFF67E8F9), style = MaterialTheme.typography.bodySmall)
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(sampleChannels) { ch ->
+                                Button(onClick = { onStartRecordChannel(ch) }) {
+                                    Text("⏺ ${ch.name}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (scheduledRecordings.isNotEmpty()) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(14.dp)) {
+                    Text("Scheduled DVR (${scheduledRecordings.size})", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold)
+                    scheduledRecordings.forEach { sched ->
+                        Text(
+                            text = "${timeFmt.format(Date(sched.startMs))} • ${sched.channelName} — ${sched.programTitle}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+        }
+
+        Text(
+            text = "Saved DVR Recordings (${recordings.size}):",
+            color = Color.White,
+            fontWeight = FontWeight.Bold,
+            style = MaterialTheme.typography.titleMedium
+        )
+
+        if (recordings.isEmpty()) {
+            Text("No DVR recordings saved yet.", color = Color(0xFFCBD5E1))
+        } else {
+            recordings.forEach { rec ->
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth().padding(12.dp)
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(rec.title, color = Color.White, fontWeight = FontWeight.Bold)
+                            Text(
+                                text = "${rec.channelName} • ${rec.sizeMb} MB • ${timeFmt.format(Date(rec.recordedAtMs))}",
+                                color = Color(0xFF67E8F9),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { onPlayRecording(rec) }) {
+                                Text("Play")
+                            }
+                            Button(
+                                onClick = { onDeleteRecording(rec) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7F1D1D))
+                            ) {
+                                Text("Delete")
+                            }
                         }
                     }
                 }
@@ -1523,8 +1839,8 @@ private fun CustomizableMultiViewPane(
         var pickerQuery by remember { mutableStateOf("") }
         val pickerList = remember(channels, pickerQuery) {
             val q = pickerQuery.trim().lowercase()
-            if (q.isEmpty()) playableDefaults.take(150)
-            else channels.filter { it.name.lowercase().contains(q) || it.category.lowercase().contains(q) }.take(150)
+            if (q.isEmpty()) playableDefaults.take(300)
+            else channels.filter { it.name.lowercase().contains(q) || it.category.lowercase().contains(q) }.take(300)
         }
 
         Card(
@@ -1856,7 +2172,7 @@ private fun CategorizedBrowserPane(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
-                items(filtered.take(300)) { entry ->
+                items(filtered.take(500)) { entry ->
                     var focused by remember { mutableStateOf(false) }
                     Card(
                         colors = CardDefaults.cardColors(
