@@ -3,6 +3,8 @@ package com.unicorntv.iptv
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
+import android.util.JsonReader
+import android.util.JsonToken
 import android.util.Xml
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -51,6 +53,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
@@ -86,7 +89,7 @@ data class PlaylistProfile(
     val epgUrl: String = "",
     val updateOnStartup: Boolean = true,
     val autoDailyUpdate: Boolean = true,
-    val dailyUpdateHour: Int = 4, // 0..23 (default 04:00)
+    val dailyUpdateHour: Int = 4,
     val lastUpdatedMs: Long = 0L
 )
 
@@ -204,7 +207,6 @@ private fun loadConfig(context: Context): IptvConfig {
     var playlists = parsePlaylistsJson(prefs.getString("playlists_json", "") ?: "")
     var activeId = prefs.getString("active_playlist_id", "") ?: ""
 
-    // Migrate legacy single-playlist fields automatically if present
     if (playlists.isEmpty()) {
         val legacyM3u = prefs.getString("m3u_url", "") ?: ""
         val legacyHost = prefs.getString("xtream_host", "") ?: ""
@@ -274,23 +276,245 @@ private fun isDailyUpdateDue(profile: PlaylistProfile, nowMs: Long = System.curr
     return profile.lastUpdatedMs < scheduledMs
 }
 
-private fun httpGetText(urlStr: String, connectTimeoutMs: Int = 20000, readTimeoutMs: Int = 90000): String {
-    val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+private fun openHttpConnection(urlStr: String, connectTimeoutMs: Int = 20000, readTimeoutMs: Int = 90000): HttpURLConnection {
+    return (URL(urlStr).openConnection() as HttpURLConnection).apply {
         connectTimeout = connectTimeoutMs
         readTimeout = readTimeoutMs
         requestMethod = "GET"
         setRequestProperty("User-Agent", "UnicornTV/2.0 (AndroidTV)")
         setRequestProperty("Accept-Encoding", "identity")
     }
+}
+
+private fun httpGetSmallText(urlStr: String, timeoutMs: Int = 20000): String {
+    val conn = openHttpConnection(urlStr, timeoutMs, timeoutMs)
     return try {
         val code = conn.responseCode
         if (code !in 200..299) throw IllegalStateException("HTTP $code")
-        BufferedReader(InputStreamReader(BufferedInputStream(conn.inputStream, 65536), Charsets.UTF_8), 65536).use {
+        BufferedReader(InputStreamReader(BufferedInputStream(conn.inputStream, 32768), Charsets.UTF_8)).use {
             it.readText()
         }
     } finally {
         conn.disconnect()
     }
+}
+
+private fun streamXtreamItems(
+    urlStr: String,
+    catMap: Map<String, String>,
+    kind: MediaKind,
+    base: String,
+    user: String,
+    pass: String,
+    outList: MutableList<MediaEntry>,
+    maxItems: Int = 15000
+) {
+    val conn = openHttpConnection(urlStr, connectTimeoutMs = 20000, readTimeoutMs = 120000)
+    try {
+        val code = conn.responseCode
+        if (code !in 200..299) throw IllegalStateException("HTTP $code")
+        val reader = JsonReader(InputStreamReader(BufferedInputStream(conn.inputStream, 65536), Charsets.UTF_8))
+        reader.isLenient = true
+        if (reader.peek() == JsonToken.BEGIN_OBJECT) {
+            reader.beginObject()
+            while (reader.hasNext()) {
+                val key = reader.nextName()
+                if (reader.peek() == JsonToken.BEGIN_ARRAY && (key == "streams" || key == "vod_streams" || key == "series" || key == "data")) {
+                    readJsonArrayItems(reader, catMap, kind, base, user, pass, outList, maxItems)
+                } else {
+                    reader.skipValue()
+                }
+            }
+            reader.endObject()
+        } else if (reader.peek() == JsonToken.BEGIN_ARRAY) {
+            readJsonArrayItems(reader, catMap, kind, base, user, pass, outList, maxItems)
+        }
+        reader.close()
+    } finally {
+        conn.disconnect()
+    }
+}
+
+private fun readJsonArrayItems(
+    reader: JsonReader,
+    catMap: Map<String, String>,
+    kind: MediaKind,
+    base: String,
+    user: String,
+    pass: String,
+    outList: MutableList<MediaEntry>,
+    maxItems: Int
+) {
+    reader.beginArray()
+    while (reader.hasNext()) {
+        if (outList.size >= maxItems) {
+            reader.skipValue()
+            continue
+        }
+        if (reader.peek() != JsonToken.BEGIN_OBJECT) {
+            reader.skipValue()
+            continue
+        }
+        var streamId = ""
+        var seriesId = ""
+        var altId = ""
+        var name = ""
+        var catId = ""
+        var catNameRaw = ""
+        var epgId = ""
+        var ext = "mp4"
+
+        reader.beginObject()
+        while (reader.hasNext()) {
+            val field = reader.nextName()
+            if (reader.peek() == JsonToken.NULL) {
+                reader.nextNull()
+                continue
+            }
+            when (field) {
+                "stream_id" -> streamId = readScalarAsString(reader)
+                "series_id" -> seriesId = readScalarAsString(reader)
+                "vod_id", "id" -> if (altId.isEmpty()) altId = readScalarAsString(reader)
+                "name", "title" -> if (name.isEmpty()) name = readScalarAsString(reader)
+                "category_id" -> catId = readScalarAsString(reader)
+                "category_name" -> catNameRaw = readScalarAsString(reader)
+                "epg_channel_id" -> epgId = readScalarAsString(reader)
+                "container_extension" -> {
+                    val v = readScalarAsString(reader)
+                    if (v.isNotBlank()) ext = v
+                }
+                else -> reader.skipValue()
+            }
+        }
+        reader.endObject()
+
+        val resolvedId = when (kind) {
+            MediaKind.SERIES -> seriesId.ifBlank { altId }.ifBlank { streamId }
+            else -> streamId.ifBlank { altId }
+        }
+        if (resolvedId.isBlank()) continue
+
+        val defaultCat = when (kind) {
+            MediaKind.LIVE -> "Live TV"
+            MediaKind.MOVIE -> "Movies"
+            MediaKind.SERIES -> "Series"
+        }
+        val category = catMap[catId] ?: catNameRaw.ifBlank { defaultCat }
+        val finalName = name.ifBlank { "$defaultCat $resolvedId" }
+        val url = when (kind) {
+            MediaKind.LIVE -> "$base/live/$user/$pass/$resolvedId.ts"
+            MediaKind.MOVIE -> "$base/movie/$user/$pass/$resolvedId.$ext"
+            MediaKind.SERIES -> "$base/player_api.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}&action=get_series_info&series_id=$resolvedId"
+        }
+
+        outList.add(
+            MediaEntry(
+                id = resolvedId,
+                name = finalName,
+                category = category,
+                streamUrl = url,
+                epgId = epgId,
+                kind = kind
+            )
+        )
+    }
+    reader.endArray()
+}
+
+private fun readScalarAsString(reader: JsonReader): String {
+    return when (reader.peek()) {
+        JsonToken.STRING -> reader.nextString()
+        JsonToken.NUMBER -> reader.nextString()
+        JsonToken.BOOLEAN -> reader.nextBoolean().toString()
+        else -> {
+            reader.skipValue()
+            ""
+        }
+    }
+}
+
+private fun streamM3uFromUrl(
+    m3uUrl: String,
+    liveOut: MutableList<MediaEntry>,
+    movieOut: MutableList<MediaEntry>,
+    seriesOut: MutableList<MediaEntry>,
+    maxPerKind: Int = 25000
+) {
+    val conn = openHttpConnection(m3uUrl, connectTimeoutMs = 20000, readTimeoutMs = 90000)
+    try {
+        val code = conn.responseCode
+        if (code !in 200..299) throw IllegalStateException("HTTP $code")
+        BufferedReader(InputStreamReader(BufferedInputStream(conn.inputStream, 65536), Charsets.UTF_8), 65536).use { reader ->
+            var pendingName = ""
+            var pendingGroup = "General"
+            var pendingTvgId = ""
+            var index = 0
+
+            while (true) {
+                val rawLine = reader.readLine() ?: break
+                val line = rawLine.trim()
+                if (line.startsWith("#EXTINF:")) {
+                    pendingGroup = extractAttr(line, "group-title").ifBlank { "General" }
+                    pendingTvgId = extractAttr(line, "tvg-id")
+                    pendingName = line.substringAfterLast(",").trim()
+                } else if (line.startsWith("http://") || line.startsWith("https://")) {
+                    index++
+                    val lower = line.lowercase()
+                    val groupLower = pendingGroup.lowercase()
+                    val kind = when {
+                        lower.contains("/movie/") || lower.endsWith(".mp4") || lower.endsWith(".mkv") || groupLower.contains("vod") || groupLower.contains("movie") -> MediaKind.MOVIE
+                        lower.contains("/series/") || groupLower.contains("series") -> MediaKind.SERIES
+                        else -> MediaKind.LIVE
+                    }
+                    val target = when (kind) {
+                        MediaKind.LIVE -> liveOut
+                        MediaKind.MOVIE -> movieOut
+                        MediaKind.SERIES -> seriesOut
+                    }
+                    if (target.size < maxPerKind) {
+                        target.add(
+                            MediaEntry(
+                                id = "m3u_$index",
+                                name = pendingName.ifBlank { "Channel $index" },
+                                category = pendingGroup,
+                                streamUrl = line,
+                                epgId = pendingTvgId,
+                                kind = kind
+                            )
+                        )
+                    }
+                    pendingName = ""
+                }
+            }
+        }
+    } finally {
+        conn.disconnect()
+    }
+}
+
+private fun extractAttr(line: String, attr: String): String {
+    val marker = "$attr=\""
+    val start = line.indexOf(marker)
+    if (start == -1) return ""
+    val valueStart = start + marker.length
+    val end = line.indexOf('"', valueStart)
+    return if (end > valueStart) line.substring(valueStart, end) else ""
+}
+
+private fun parseCategoryMap(jsonText: String): Map<String, String> {
+    val map = mutableMapOf<String, String>()
+    runCatching {
+        val trimmed = jsonText.trim()
+        if (!trimmed.startsWith("[")) return@runCatching
+        val arr = JSONArray(trimmed)
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val id = obj.optString("category_id").ifBlank { obj.optString("id") }
+            val name = obj.optString("category_name").ifBlank { obj.optString("name") }
+            if (id.isNotBlank() && name.isNotBlank()) map[id] = name
+        }
+    }
+    return map
 }
 
 private fun cleanTitleAndYear(rawName: String): Pair<String, String?> {
@@ -323,7 +547,7 @@ private suspend fun fetchImDbInfo(
     val url = "https://www.omdbapi.com/?apikey=${Uri.encode(key)}&t=${Uri.encode(cleanTitle)}$yearParam&type=$typeParam"
 
     runCatching {
-        val obj = JSONObject(httpGetText(url, connectTimeoutMs = 10000, readTimeoutMs = 15000))
+        val obj = JSONObject(httpGetSmallText(url, timeoutMs = 12000))
         if (!obj.optString("Response").equals("True", ignoreCase = true)) {
             return@runCatching null
         }
@@ -352,108 +576,49 @@ private suspend fun fetchCatalogForPlaylist(
     val cleanHost = playlist.xtreamHost.trim().removeSuffix("/")
     val user = playlist.xtreamUser.trim()
     val pass = playlist.xtreamPass.trim()
+    val hasXtream = cleanHost.isNotBlank() && user.isNotBlank() && pass.isNotBlank()
 
     try {
-        if (cleanHost.isNotBlank() && user.isNotBlank() && pass.isNotBlank()) {
+        if (hasXtream) {
             val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
             val apiBase = "$base/player_api.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
 
-            onProgress("[${playlist.name}] Loading Live TV channels...")
+            onProgress("[${playlist.name}] Streaming Live TV channels...")
             val liveCatMap = parseCategoryMap(
-                runCatching { httpGetText("$apiBase&action=get_live_categories", readTimeoutMs = 45000) }.getOrDefault("[]")
+                runCatching { httpGetSmallText("$apiBase&action=get_live_categories", timeoutMs = 30000) }.getOrDefault("[]")
             )
             runCatching {
-                val liveRaw = httpGetText("$apiBase&action=get_live_streams", readTimeoutMs = 90000)
-                parseJsonArrayEntries(liveRaw).forEach { obj ->
-                    val streamId = firstNonBlank(obj.optString("stream_id"), obj.optString("id"), obj.optString("num"))
-                    if (streamId.isBlank()) return@forEach
-                    val name = obj.optString("name", "Channel $streamId")
-                    val catId = obj.optString("category_id")
-                    val catName = liveCatMap[catId] ?: obj.optString("category_name").ifBlank { "Live TV" }
-                    val epgId = obj.optString("epg_channel_id", "")
-                    liveList.add(
-                        MediaEntry(
-                            id = streamId,
-                            name = name,
-                            category = catName,
-                            streamUrl = "$base/live/$user/$pass/$streamId.ts",
-                            epgId = epgId,
-                            kind = MediaKind.LIVE
-                        )
-                    )
-                }
+                streamXtreamItems("$apiBase&action=get_live_streams", liveCatMap, MediaKind.LIVE, base, user, pass, liveList)
             }.onFailure { warnings.add("Live: ${it.message}") }
 
-            onProgress("[${playlist.name}] Loading VOD Movies...")
+            onProgress("[${playlist.name}] Streaming VOD Movies...")
             val vodCatMap = parseCategoryMap(
-                runCatching { httpGetText("$apiBase&action=get_vod_categories", readTimeoutMs = 45000) }.getOrDefault("[]")
+                runCatching { httpGetSmallText("$apiBase&action=get_vod_categories", timeoutMs = 30000) }.getOrDefault("[]")
             )
             runCatching {
-                val vodRaw = httpGetText("$apiBase&action=get_vod_streams", readTimeoutMs = 120000)
-                parseJsonArrayEntries(vodRaw).forEach { obj ->
-                    val streamId = firstNonBlank(obj.optString("stream_id"), obj.optString("vod_id"), obj.optString("id"))
-                    if (streamId.isBlank()) return@forEach
-                    val name = obj.optString("name", obj.optString("title", "Movie $streamId"))
-                    val catId = obj.optString("category_id")
-                    val catName = vodCatMap[catId] ?: obj.optString("category_name").ifBlank { "Movies" }
-                    val ext = obj.optString("container_extension", "mp4").ifBlank { "mp4" }
-                    movieList.add(
-                        MediaEntry(
-                            id = streamId,
-                            name = name,
-                            category = catName,
-                            streamUrl = "$base/movie/$user/$pass/$streamId.$ext",
-                            kind = MediaKind.MOVIE,
-                            plot = obj.optString("plot", "")
-                        )
-                    )
-                }
+                streamXtreamItems("$apiBase&action=get_vod_streams", vodCatMap, MediaKind.MOVIE, base, user, pass, movieList)
             }.onFailure { warnings.add("VOD: ${it.message}") }
 
-            onProgress("[${playlist.name}] Loading TV Series...")
+            onProgress("[${playlist.name}] Streaming TV Series...")
             val serCatMap = parseCategoryMap(
-                runCatching { httpGetText("$apiBase&action=get_series_categories", readTimeoutMs = 45000) }.getOrDefault("[]")
+                runCatching { httpGetSmallText("$apiBase&action=get_series_categories", timeoutMs = 30000) }.getOrDefault("[]")
             )
             runCatching {
-                val serRaw = httpGetText("$apiBase&action=get_series", readTimeoutMs = 90000)
-                parseJsonArrayEntries(serRaw).forEach { obj ->
-                    val seriesId = firstNonBlank(obj.optString("series_id"), obj.optString("id"))
-                    if (seriesId.isBlank()) return@forEach
-                    val name = obj.optString("name", obj.optString("title", "Series $seriesId"))
-                    val catId = obj.optString("category_id")
-                    val catName = serCatMap[catId] ?: obj.optString("category_name").ifBlank { "Series" }
-                    seriesList.add(
-                        MediaEntry(
-                            id = seriesId,
-                            name = name,
-                            category = catName,
-                            streamUrl = "$apiBase&action=get_series_info&series_id=$seriesId",
-                            kind = MediaKind.SERIES,
-                            plot = obj.optString("plot", "")
-                        )
-                    )
-                }
+                streamXtreamItems("$apiBase&action=get_series", serCatMap, MediaKind.SERIES, base, user, pass, seriesList)
             }.onFailure { warnings.add("Series: ${it.message}") }
-        }
-
-        if (playlist.m3uUrl.isNotBlank() && (liveList.isEmpty() || movieList.isEmpty())) {
-            onProgress("[${playlist.name}] Parsing M3U fallback...")
-            val m3uLive = mutableListOf<MediaEntry>()
-            val m3uMovies = mutableListOf<MediaEntry>()
-            val m3uSeries = mutableListOf<MediaEntry>()
-            val rawM3u = httpGetText(playlist.m3uUrl.trim(), readTimeoutMs = 90000)
-            parseM3uIntoLists(rawM3u, m3uLive, m3uMovies, m3uSeries)
-            if (liveList.isEmpty()) liveList.addAll(m3uLive)
-            if (movieList.isEmpty()) movieList.addAll(m3uMovies)
-            if (seriesList.isEmpty()) seriesList.addAll(m3uSeries)
+        } else if (playlist.m3uUrl.isNotBlank()) {
+            onProgress("[${playlist.name}] Streaming M3U playlist...")
+            runCatching {
+                streamM3uFromUrl(playlist.m3uUrl.trim(), liveList, movieList, seriesList)
+            }.onFailure { warnings.add("M3U: ${it.message}") }
         }
     } catch (e: Exception) {
         warnings.add(e.localizedMessage ?: "Failed to load playlist")
     }
 
-    onProgress("[${playlist.name}] Downloading XMLTV EPG guide...")
+    onProgress("[${playlist.name}] Streaming 7-day XMLTV EPG guide...")
     val epgUrl = playlist.epgUrl.trim().ifBlank {
-        if (cleanHost.isNotBlank() && user.isNotBlank() && pass.isNotBlank()) {
+        if (hasXtream) {
             val base = if (cleanHost.startsWith("http")) cleanHost else "http://$cleanHost"
             "$base/xmltv.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}"
         } else ""
@@ -476,90 +641,11 @@ private suspend fun fetchCatalogForPlaylist(
     )
 }
 
-private fun firstNonBlank(vararg values: String): String =
-    values.firstOrNull { it.isNotBlank() && it != "null" } ?: ""
-
-private fun parseJsonArrayEntries(raw: String): List<JSONObject> {
-    val trimmed = raw.trim()
-    if (trimmed.isEmpty()) return emptyList()
-    val arr = if (trimmed.startsWith("[")) {
-        JSONArray(trimmed)
-    } else if (trimmed.startsWith("{")) {
-        val obj = JSONObject(trimmed)
-        obj.optJSONArray("streams")
-            ?: obj.optJSONArray("vod_streams")
-            ?: obj.optJSONArray("series")
-            ?: obj.optJSONArray("data")
-            ?: JSONArray()
-    } else {
-        JSONArray()
-    }
-    val out = ArrayList<JSONObject>(arr.length())
-    for (i in 0 until arr.length()) {
-        val item = arr.optJSONObject(i)
-        if (item != null) out.add(item)
-    }
-    return out
-}
-
-private fun parseCategoryMap(jsonText: String): Map<String, String> {
-    val map = mutableMapOf<String, String>()
-    parseJsonArrayEntries(jsonText).forEach { obj ->
-        val id = firstNonBlank(obj.optString("category_id"), obj.optString("id"))
-        val name = firstNonBlank(obj.optString("category_name"), obj.optString("name"))
-        if (id.isNotBlank() && name.isNotBlank()) map[id] = name
-    }
-    return map
-}
-
-private fun parseM3uIntoLists(
-    content: String,
-    liveOut: MutableList<MediaEntry>,
-    movieOut: MutableList<MediaEntry>,
-    seriesOut: MutableList<MediaEntry>
-) {
-    var pendingName = ""
-    var pendingGroup = "General"
-    var pendingTvgId = ""
-    var index = 0
-
-    content.lineSequence().forEach { rawLine ->
-        val line = rawLine.trim()
-        if (line.startsWith("#EXTINF:")) {
-            pendingGroup = Regex("""group-title="([^"]*)"""").find(line)?.groupValues?.getOrNull(1)?.ifBlank { "General" } ?: "General"
-            pendingTvgId = Regex("""tvg-id="([^"]*)"""").find(line)?.groupValues?.getOrNull(1) ?: ""
-            pendingName = line.substringAfterLast(",").trim().ifBlank { "Stream ${index + 1}" }
-        } else if (line.startsWith("http://") || line.startsWith("https://")) {
-            index++
-            val lower = line.lowercase()
-            val groupLower = pendingGroup.lowercase()
-            val kind = when {
-                lower.contains("/movie/") || lower.endsWith(".mp4") || lower.endsWith(".mkv") || groupLower.contains("vod") || groupLower.contains("movie") -> MediaKind.MOVIE
-                lower.contains("/series/") || groupLower.contains("series") -> MediaKind.SERIES
-                else -> MediaKind.LIVE
-            }
-            val entry = MediaEntry(
-                id = "m3u_$index",
-                name = pendingName.ifBlank { "Channel $index" },
-                category = pendingGroup,
-                streamUrl = line,
-                epgId = pendingTvgId,
-                kind = kind
-            )
-            when (kind) {
-                MediaKind.LIVE -> liveOut.add(entry)
-                MediaKind.MOVIE -> movieOut.add(entry)
-                MediaKind.SERIES -> seriesOut.add(entry)
-            }
-            pendingName = ""
-        }
-    }
-}
-
+// 7-day lookahead XMLTV EPG parser (from 2 hours ago to 7 days ahead)
 private fun fetchEpgTimelineMap(epgUrl: String): Map<String, List<EpgSlot>> {
     val nowMs = System.currentTimeMillis()
-    val windowStart = nowMs - 2 * 3600_000L
-    val windowEnd = nowMs + 8 * 3600_000L
+    val windowStart = nowMs - 2L * 3600_000L
+    val windowEnd = nowMs + 7L * 24L * 3600_000L
     val grouped = mutableMapOf<String, MutableList<EpgSlot>>()
 
     val fmt = SimpleDateFormat("yyyyMMddHHmmss Z", Locale.US).apply {
@@ -571,11 +657,7 @@ private fun fetchEpgTimelineMap(epgUrl: String): Map<String, List<EpgSlot>> {
         return runCatching { fmt.parse(normalized)?.time ?: 0L }.getOrDefault(0L)
     }
 
-    val conn = (URL(epgUrl).openConnection() as HttpURLConnection).apply {
-        connectTimeout = 20000
-        readTimeout = 90000
-        requestMethod = "GET"
-    }
+    val conn = openHttpConnection(epgUrl, connectTimeoutMs = 20000, readTimeoutMs = 90000)
     try {
         BufferedInputStream(conn.inputStream, 65536).use { stream ->
             val parser = Xml.newPullParser()
@@ -604,7 +686,7 @@ private fun fetchEpgTimelineMap(epgUrl: String): Map<String, List<EpgSlot>> {
                         if (parser.name == "programme" && inProgramme) {
                             if (progChannel.isNotBlank() && progTitle.isNotBlank() && progStop >= windowStart && progStart <= windowEnd) {
                                 val list = grouped.getOrPut(progChannel) { mutableListOf() }
-                                if (list.size < 6) {
+                                if (list.size < 48) {
                                     list.add(EpgSlot(progTitle, progStart, progStop))
                                 }
                             }
@@ -623,7 +705,7 @@ private fun fetchEpgTimelineMap(epgUrl: String): Map<String, List<EpgSlot>> {
 
 private suspend fun resolveFirstSeriesEpisodeUrl(seriesInfoUrl: String): String? = withContext(Dispatchers.IO) {
     runCatching {
-        val root = JSONObject(httpGetText(seriesInfoUrl, readTimeoutMs = 30000))
+        val root = JSONObject(httpGetSmallText(seriesInfoUrl, timeoutMs = 25000))
         val episodesObj = root.optJSONObject("episodes") ?: return@runCatching null
         val keys = episodesObj.keys()
         if (!keys.hasNext()) return@runCatching null
@@ -662,8 +744,60 @@ fun UnicornTvApp() {
     var isLoadingCatalog by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
 
-    var fullScreenItem by remember { mutableStateOf<MediaEntry?>(null) }
-    var lastWatchedLiveChannel by remember { mutableStateOf<MediaEntry?>(null) }
+    var activeChannel by remember { mutableStateOf<MediaEntry?>(null) }
+    var isFullScreenTv by remember { mutableStateOf(false) }
+    var streamError by remember { mutableStateOf<String?>(null) }
+
+    // Single persistent ExoPlayer so returning from full-screen to TV Guide keeps the exact channel playing
+    val tvPlayer = remember(config.bufferSeconds, config.maxHeightPx) {
+        val bufferMs = (config.bufferSeconds * 1000).coerceIn(5000, 40000)
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(bufferMs, bufferMs * 2, 1500, 2500)
+            .build()
+
+        ExoPlayer.Builder(context)
+            .setLoadControl(loadControl)
+            .setSeekBackIncrementMs(15_000L)
+            .setSeekForwardIncrementMs(15_000L)
+            .build()
+            .apply {
+                trackSelectionParameters = trackSelectionParameters
+                    .buildUpon()
+                    .setMaxVideoSize(3840, config.maxHeightPx)
+                    .build()
+                playWhenReady = true
+            }
+    }
+
+    DisposableEffect(tvPlayer) {
+        val listener = object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                streamError = error.errorCodeName
+            }
+        }
+        tvPlayer.addListener(listener)
+        onDispose {
+            tvPlayer.removeListener(listener)
+            runCatching {
+                tvPlayer.stop()
+                tvPlayer.release()
+            }
+        }
+    }
+
+    fun tuneToEntry(entry: MediaEntry, fullScreen: Boolean) {
+        streamError = null
+        val url = entry.streamUrl.trim()
+        val isDifferent = activeChannel?.streamUrl != url
+        activeChannel = entry
+        if (url.isNotBlank() && isDifferent) {
+            tvPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(url)))
+            tvPlayer.prepare()
+        }
+        tvPlayer.playWhenReady = true
+        tvPlayer.play()
+        isFullScreenTv = fullScreen
+    }
 
     fun loadPlaylistNow(playlist: PlaylistProfile, currentConfig: IptvConfig = config) {
         if (playlist.m3uUrl.isBlank() && playlist.xtreamHost.isBlank()) return
@@ -684,8 +818,11 @@ fun UnicornTvApp() {
             config = updatedCfg
             saveConfig(context, updatedCfg)
 
-            if (lastWatchedLiveChannel == null) {
-                lastWatchedLiveChannel = loaded.live.firstOrNull { !it.name.startsWith("#") } ?: loaded.live.firstOrNull()
+            if (activeChannel == null) {
+                val firstLive = loaded.live.firstOrNull { !it.name.startsWith("#") } ?: loaded.live.firstOrNull()
+                if (firstLive != null) {
+                    tuneToEntry(firstLive, fullScreen = false)
+                }
             }
             statusMessage = if (loaded.error != null) {
                 "'${playlist.name}' loaded with notice: ${loaded.error}"
@@ -695,7 +832,6 @@ fun UnicornTvApp() {
         }
     }
 
-    // Initial startup load (if Update on Startup or Daily Scheduled Update is due)
     LaunchedEffect(Unit) {
         val active = config.activePlaylist
         if (active != null && (active.updateOnStartup || isDailyUpdateDue(active) || active.lastUpdatedMs == 0L)) {
@@ -703,7 +839,6 @@ fun UnicornTvApp() {
         }
     }
 
-    // Background scheduler: checks every 60s whether the active playlist's daily scheduled hour has arrived
     LaunchedEffect(config.activePlaylistId, config.playlists) {
         while (true) {
             delay(60_000L)
@@ -719,16 +854,12 @@ fun UnicornTvApp() {
         return
     }
 
-    fullScreenItem?.let { current ->
-        FullScreenPlayerOverlay(
-            entry = current,
-            config = config,
+    if (isFullScreenTv && activeChannel != null) {
+        FullScreenCleanTvOverlay(
+            player = tvPlayer,
             onBackToGuide = {
-                if (current.kind == MediaKind.LIVE) {
-                    lastWatchedLiveChannel = current
-                    selectedSection = TvSection.GUIDE
-                }
-                fullScreenItem = null
+                isFullScreenTv = false
+                selectedSection = TvSection.GUIDE
             }
         )
         return
@@ -830,14 +961,12 @@ fun UnicornTvApp() {
                         config = updatedCfg
                         saveConfig(context, updatedCfg)
                         if (targetActiveId == profile.id) {
-                            lastWatchedLiveChannel = null
                             loadPlaylistNow(profile, updatedCfg)
                         } else {
                             statusMessage = "Saved playlist '${profile.name}'."
                         }
                     },
                     onActivatePlaylist = { profile ->
-                        lastWatchedLiveChannel = null
                         loadPlaylistNow(profile, config)
                     },
                     onDeletePlaylist = { profile ->
@@ -855,17 +984,15 @@ fun UnicornTvApp() {
                     }
                 )
 
-                TvSection.GUIDE -> RealTvGuidePane(
+                TvSection.GUIDE -> SevenDayTvGuidePane(
                     channels = catalog.live,
                     epgTimeline = catalog.epgTimeline,
-                    activeChannel = lastWatchedLiveChannel,
-                    config = config,
-                    onActiveChannelChange = { lastWatchedLiveChannel = it },
+                    activeChannel = activeChannel,
+                    player = tvPlayer,
+                    previewError = streamError,
+                    onTuneChannel = { ch -> tuneToEntry(ch, fullScreen = false) },
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onOpenFullScreen = { ch ->
-                        lastWatchedLiveChannel = ch
-                        fullScreenItem = ch
-                    }
+                    onOpenFullScreen = { ch -> tuneToEntry(ch, fullScreen = true) }
                 )
 
                 TvSection.MOVIES -> CategorizedBrowserPane(
@@ -874,7 +1001,7 @@ fun UnicornTvApp() {
                     isSeries = false,
                     emptyText = "No VOD movies loaded yet. Check Setup or update your active playlist.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onSelectEntry = { fullScreenItem = it }
+                    onSelectEntry = { tuneToEntry(it, fullScreen = true) }
                 )
 
                 TvSection.SERIES -> CategorizedBrowserPane(
@@ -891,7 +1018,7 @@ fun UnicornTvApp() {
                                 seriesItem.streamUrl
                             }
                             if (!epUrl.isNullOrBlank()) {
-                                fullScreenItem = seriesItem.copy(streamUrl = epUrl)
+                                tuneToEntry(seriesItem.copy(streamUrl = epUrl), fullScreen = true)
                             } else {
                                 statusMessage = "Could not resolve episode stream for ${seriesItem.name}."
                             }
@@ -942,10 +1069,7 @@ fun UnicornTvApp() {
                     isSeries = false,
                     emptyText = "No channels available yet.",
                     onGoToSetup = { selectedSection = TvSection.SETUP },
-                    onSelectEntry = {
-                        lastWatchedLiveChannel = it
-                        fullScreenItem = it
-                    }
+                    onSelectEntry = { tuneToEntry(it, fullScreen = true) }
                 )
             }
         }
@@ -953,340 +1077,42 @@ fun UnicornTvApp() {
 }
 
 @Composable
-private fun SetupAndPlaylistsPane(
-    config: IptvConfig,
-    catalog: LoadedCatalog,
-    isLoading: Boolean,
-    statusMessage: String,
-    onSavePlaylist: (PlaylistProfile, makeActive: Boolean) -> Unit,
-    onActivatePlaylist: (PlaylistProfile) -> Unit,
-    onDeletePlaylist: (PlaylistProfile) -> Unit
+private fun FullScreenCleanTvOverlay(
+    player: ExoPlayer,
+    onBackToGuide: () -> Unit
 ) {
-    val initialProfile = config.activePlaylist ?: PlaylistProfile(name = "Unicorn TV Main")
-    var editingId by remember { mutableStateOf(initialProfile.id) }
-    var playlistName by remember { mutableStateOf(initialProfile.name) }
-    var m3uUrl by remember { mutableStateOf(initialProfile.m3uUrl) }
-    var xtreamHost by remember { mutableStateOf(initialProfile.xtreamHost) }
-    var xtreamUser by remember { mutableStateOf(initialProfile.xtreamUser) }
-    var xtreamPass by remember { mutableStateOf(initialProfile.xtreamPass) }
-    var epgUrl by remember { mutableStateOf(initialProfile.epgUrl) }
-    var updateOnStartup by remember { mutableStateOf(initialProfile.updateOnStartup) }
-    var autoDailyUpdate by remember { mutableStateOf(initialProfile.autoDailyUpdate) }
-    var dailyUpdateHour by remember { mutableStateOf(initialProfile.dailyUpdateHour) }
+    BackHandler { onBackToGuide() }
 
-    fun loadIntoEditor(p: PlaylistProfile) {
-        editingId = p.id
-        playlistName = p.name
-        m3uUrl = p.m3uUrl
-        xtreamHost = p.xtreamHost
-        xtreamUser = p.xtreamUser
-        xtreamPass = p.xtreamPass
-        epgUrl = p.epgUrl
-        updateOnStartup = p.updateOnStartup
-        autoDailyUpdate = p.autoDailyUpdate
-        dailyUpdateHour = p.dailyUpdateHour
-    }
-
-    val dateFmt = remember { SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()) }
-
-    Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxSize()) {
-        // Left Column: Saved Playlists List + "+ Add New Playlist" button
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
-            modifier = Modifier
-                .width(275.dp)
-                .fillMaxHeight()
-        ) {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(12.dp)
-            ) {
-                Row(
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "Saved Playlists (${config.playlists.size})",
-                        color = Color.White,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Button(
-                        onClick = {
-                            loadIntoEditor(
-                                PlaylistProfile(
-                                    name = "Playlist ${config.playlists.size + 1}",
-                                    updateOnStartup = true,
-                                    autoDailyUpdate = true,
-                                    dailyUpdateHour = 4
-                                )
-                            )
-                        },
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                    ) {
-                        Text("+ New")
-                    }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    ) {
+        AndroidView(
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    this.player = player
+                    useController = true
+                    setShowRewindButton(true)
+                    setShowFastForwardButton(true)
+                    setShowPreviousButton(false)
+                    setShowNextButton(false)
                 }
-
-                if (config.playlists.isEmpty()) {
-                    Text(
-                        text = "No saved playlists yet. Fill out the form on the right and click Save & Load.",
-                        color = Color(0xFFCBD5E1),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                } else {
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.fillMaxSize()
-                    ) {
-                        items(config.playlists) { item ->
-                            val isActive = item.id == config.activePlaylistId
-                            val isEditing = item.id == editingId
-                            Card(
-                                colors = CardDefaults.cardColors(
-                                    containerColor = if (isActive) Color(0xFF3B1976) else Color(0xFF24104A)
-                                ),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .border(
-                                        width = if (isEditing || isActive) 2.dp else 1.dp,
-                                        color = if (isActive) Color(0xFF4ADE80) else if (isEditing) Color(0xFF38BDF8) else Color(0xFF4C1D95),
-                                        shape = RoundedCornerShape(10.dp)
-                                    )
-                            ) {
-                                Column(
-                                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                                    modifier = Modifier.padding(10.dp)
-                                ) {
-                                    Text(
-                                        text = "${if (isActive) "✓ " else ""}${item.name}",
-                                        color = Color.White,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    val schedText = buildString {
-                                        if (item.updateOnStartup) append("Startup")
-                                        if (item.autoDailyUpdate) {
-                                            if (isNotEmpty()) append(" + ")
-                                            append("Daily ${"%02d:00".format(item.dailyUpdateHour)}")
-                                        }
-                                        if (isEmpty()) append("Manual update")
-                                    }
-                                    Text(
-                                        text = "Auto: $schedText",
-                                        color = Color(0xFF67E8F9),
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                    Text(
-                                        text = if (item.lastUpdatedMs > 0L) {
-                                            "Updated: ${dateFmt.format(Date(item.lastUpdatedMs))}"
-                                        } else {
-                                            "Not synced yet"
-                                        },
-                                        color = Color(0xFFCBD5E1),
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Button(
-                                            enabled = !isLoading,
-                                            onClick = {
-                                                loadIntoEditor(item)
-                                                onActivatePlaylist(item)
-                                            },
-                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                                        ) {
-                                            Text(if (isActive) "Sync" else "Use", style = MaterialTheme.typography.labelSmall)
-                                        }
-                                        Button(
-                                            onClick = { loadIntoEditor(item) },
-                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                                        ) {
-                                            Text("Edit", style = MaterialTheme.typography.labelSmall)
-                                        }
-                                        Button(
-                                            onClick = { onDeletePlaylist(item) },
-                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7F1D1D)),
-                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                                        ) {
-                                            Text("Del", style = MaterialTheme.typography.labelSmall)
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Right Column: Playlist Form + Auto-Update Schedule
-        Column(
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxHeight()
-                .verticalScroll(rememberScrollState())
-        ) {
-            TvInputField(
-                value = playlistName,
-                onValueChange = { playlistName = it },
-                label = "Playlist Name (e.g., Main IPTV, Sports Backup)",
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            TvInputField(
-                value = m3uUrl,
-                onValueChange = { m3uUrl = it },
-                label = "M3U / M3U8 Playlist URL (Optional if using Xtream)",
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                TvInputField(
-                    value = xtreamHost,
-                    onValueChange = { xtreamHost = it },
-                    label = "Xtream Server URL",
-                    modifier = Modifier.weight(1f)
-                )
-                TvInputField(
-                    value = xtreamUser,
-                    onValueChange = { xtreamUser = it },
-                    label = "Username",
-                    modifier = Modifier.weight(1f)
-                )
-                TvInputField(
-                    value = xtreamPass,
-                    onValueChange = { xtreamPass = it },
-                    label = "Password",
-                    isPassword = true,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-
-            TvInputField(
-                value = epgUrl,
-                onValueChange = { epgUrl = it },
-                label = "EPG (XMLTV) URL",
-                imeAction = ImeAction.Done,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            // Auto-Update Schedule Card
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.padding(12.dp)
-                ) {
-                    Text(
-                        text = "Automatic Playlist & EPG Update Schedule",
-                        color = Color(0xFF38BDF8),
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleSmall
-                    )
-
-                    Row(
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Update automatically on each app startup", color = Color.White)
-                        Switch(
-                            checked = updateOnStartup,
-                            onCheckedChange = { updateOnStartup = it }
-                        )
-                    }
-
-                    Row(
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Update automatically once every day", color = Color.White)
-                        Switch(
-                            checked = autoDailyUpdate,
-                            onCheckedChange = { autoDailyUpdate = it }
-                        )
-                    }
-
-                    if (autoDailyUpdate) {
-                        Text(
-                            text = "Select Daily Update Time: ${"%02d:00".format(dailyUpdateHour)}",
-                            color = Color(0xFF67E8F9),
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            items((0..23).toList()) { hour ->
-                                val selected = dailyUpdateHour == hour
-                                Button(
-                                    onClick = { dailyUpdateHour = hour },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = if (selected) Color(0xFFD946EF) else Color(0xFF3B1976)
-                                    ),
-                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                                ) {
-                                    Text("${"%02d:00".format(hour)}", style = MaterialTheme.typography.labelSmall)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(
-                    enabled = !isLoading,
-                    onClick = {
-                        val existing = config.playlists.firstOrNull { it.id == editingId }
-                        val profile = PlaylistProfile(
-                            id = editingId,
-                            name = playlistName.trim().ifBlank { "My IPTV Playlist" },
-                            m3uUrl = m3uUrl.trim(),
-                            xtreamHost = xtreamHost.trim(),
-                            xtreamUser = xtreamUser.trim(),
-                            xtreamPass = xtreamPass,
-                            epgUrl = epgUrl.trim(),
-                            updateOnStartup = updateOnStartup,
-                            autoDailyUpdate = autoDailyUpdate,
-                            dailyUpdateHour = dailyUpdateHour,
-                            lastUpdatedMs = existing?.lastUpdatedMs ?: 0L
-                        )
-                        onSavePlaylist(profile, true)
-                    }
-                ) {
-                    Text(if (isLoading) "Updating Playlist..." else "Save & Load Playlist")
-                }
-
-                if (statusMessage.isNotBlank()) {
-                    Text(statusMessage, color = Color(0xFF4ADE80), modifier = Modifier.weight(1f))
-                }
-            }
-
-            if (isLoading) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-            }
-
-            Text(
-                text = "Loaded Catalog: ${catalog.live.size} Live • ${catalog.movies.size} Movies • ${catalog.series.size} Series • ${catalog.epgTimeline.size} EPG Channels",
-                color = Color.White,
-                fontWeight = FontWeight.SemiBold
-            )
-        }
+            },
+            update = { view -> view.player = player },
+            modifier = Modifier.fillMaxSize()
+        )
     }
 }
 
 @Composable
-private fun RealTvGuidePane(
+private fun SevenDayTvGuidePane(
     channels: List<MediaEntry>,
     epgTimeline: Map<String, List<EpgSlot>>,
     activeChannel: MediaEntry?,
-    config: IptvConfig,
-    onActiveChannelChange: (MediaEntry) -> Unit,
+    player: ExoPlayer,
+    previewError: String?,
+    onTuneChannel: (MediaEntry) -> Unit,
     onGoToSetup: () -> Unit,
     onOpenFullScreen: (MediaEntry) -> Unit
 ) {
@@ -1306,11 +1132,38 @@ private fun RealTvGuidePane(
     }
     var selectedCategory by remember(categories) { mutableStateOf(categories.first()) }
 
-    val previewChannel = activeChannel ?: channels.first()
-    var previewError by remember(previewChannel.streamUrl) { mutableStateOf<String?>(null) }
-
     val nowMs = System.currentTimeMillis()
-    val timeFmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+    val dayOptions = remember(nowMs) {
+        val dayFmt = SimpleDateFormat("EEE, MMM d", Locale.getDefault())
+        (0..6).map { dayOffset ->
+            val startOfDay = Calendar.getInstance().apply {
+                timeInMillis = nowMs
+                add(Calendar.DAY_OF_YEAR, dayOffset)
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+            val endOfDay = startOfDay + 24L * 3600_000L
+            val label = if (dayOffset == 0) "Today (${dayFmt.format(Date(startOfDay))})" else dayFmt.format(Date(startOfDay))
+            Triple(dayOffset, label, startOfDay to endOfDay)
+        }
+    }
+    var selectedDayOffset by remember { mutableStateOf(0) }
+    val activeDayRange = dayOptions.firstOrNull { it.first == selectedDayOffset }?.third ?: (nowMs to (nowMs + 24L * 3600_000L))
+
+    val time24Fmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+    val current24Time = time24Fmt.format(Date(nowMs))
+
+    val currentPreview = activeChannel ?: channels.first()
+    var isPaused by remember { mutableStateOf(!player.playWhenReady) }
+
+    LaunchedEffect(player) {
+        while (true) {
+            isPaused = !player.playWhenReady || player.playbackState == Player.STATE_READY && !player.isPlaying
+            delay(500L)
+        }
+    }
 
     val filtered = remember(channels, selectedCategory, searchQuery, epgTimeline) {
         val byCat = if (selectedCategory.startsWith("All (")) channels
@@ -1329,54 +1182,13 @@ private fun RealTvGuidePane(
         }
     }
 
-    val context = LocalContext.current
-    val previewPlayer = remember(previewChannel.streamUrl, config.bufferSeconds, config.maxHeightPx) {
-        val url = previewChannel.streamUrl.trim()
-        if (url.isBlank()) {
-            null
-        } else {
-            runCatching {
-                val bufferMs = (config.bufferSeconds * 1000).coerceIn(5000, 40000)
-                val loadControl = DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(bufferMs, bufferMs * 2, 1500, 2500)
-                    .build()
-
-                ExoPlayer.Builder(context)
-                    .setLoadControl(loadControl)
-                    .build()
-                    .apply {
-                        trackSelectionParameters = trackSelectionParameters
-                            .buildUpon()
-                            .setMaxVideoSize(1280, config.maxHeightPx.coerceAtMost(1080))
-                            .build()
-                        playWhenReady = true
-                        addListener(object : Player.Listener {
-                            override fun onPlayerError(error: PlaybackException) {
-                                previewError = error.errorCodeName
-                            }
-                        })
-                        setMediaItem(MediaItem.fromUri(Uri.parse(url)))
-                        prepare()
-                    }
-            }.getOrNull()
-        }
-    }
-
-    DisposableEffect(previewPlayer) {
-        onDispose {
-            runCatching {
-                previewPlayer?.stop()
-                previewPlayer?.release()
-            }
-        }
-    }
-
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxSize()) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
+        // Top Bar: Live Preview + Rewind / Pause / Live TV Controls + Search (keeps playing)
         Row(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier
                 .fillMaxWidth()
-                .height(155.dp)
+                .height(160.dp)
         ) {
             Box(
                 contentAlignment = Alignment.Center,
@@ -1385,24 +1197,24 @@ private fun RealTvGuidePane(
                     .fillMaxHeight()
                     .background(Color.Black, RoundedCornerShape(10.dp))
                     .border(2.dp, Color(0xFF38BDF8), RoundedCornerShape(10.dp))
-                    .clickable { onOpenFullScreen(previewChannel) }
+                    .clickable { onOpenFullScreen(currentPreview) }
             ) {
-                if (previewPlayer != null && previewError == null) {
+                if (previewError == null) {
                     AndroidView(
                         factory = { ctx ->
                             PlayerView(ctx).apply {
-                                this.player = previewPlayer
+                                this.player = player
                                 useController = false
                             }
                         },
-                        update = { view -> view.player = previewPlayer },
+                        update = { view -> view.player = player },
                         modifier = Modifier
                             .fillMaxSize()
                             .clip(RoundedCornerShape(10.dp))
                     )
                 } else {
                     Text(
-                        text = previewError ?: "Preview unavailable",
+                        text = previewError,
                         color = Color(0xFFCBD5E1),
                         style = MaterialTheme.typography.bodySmall
                     )
@@ -1415,47 +1227,84 @@ private fun RealTvGuidePane(
                     .weight(1f)
                     .fillMaxHeight()
             ) {
-                val slots = epgTimeline[previewChannel.epgId].orEmpty()
-                val currentSlot = slots.firstOrNull { nowMs in it.startMs..it.stopMs } ?: slots.firstOrNull()
-                val nextSlot = slots.firstOrNull { it.startMs > (currentSlot?.startMs ?: nowMs) }
+                val slotsForPreview = epgTimeline[currentPreview.epgId].orEmpty()
+                val slotInDay = slotsForPreview.firstOrNull { it.stopMs >= activeDayRange.first && it.startMs <= activeDayRange.second }
+                    ?: slotsForPreview.firstOrNull()
 
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = previewChannel.name,
+                            text = currentPreview.name,
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f)
                         )
-                        Button(onClick = { onOpenFullScreen(previewChannel) }) {
+                        Text(
+                            text = "24h Clock: $current24Time",
+                            color = Color(0xFF67E8F9),
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(horizontal = 8.dp)
+                        )
+                        Button(onClick = { onOpenFullScreen(currentPreview) }) {
                             Text("Full Screen")
                         }
                     }
+
                     Text(
-                        text = if (currentSlot != null) {
-                            "Now (${timeFmt.format(Date(currentSlot.startMs))}–${timeFmt.format(Date(currentSlot.stopMs))}): ${currentSlot.title}"
+                        text = if (slotInDay != null) {
+                            "${time24Fmt.format(Date(slotInDay.startMs))}–${time24Fmt.format(Date(slotInDay.stopMs))}  •  ${slotInDay.title}"
                         } else {
-                            "Now: No programme info (${previewChannel.category})"
+                            "Category: ${currentPreview.category}"
                         },
                         color = Color(0xFF4ADE80),
                         style = MaterialTheme.typography.bodySmall,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    if (nextSlot != null) {
-                        Text(
-                            text = "Next (${timeFmt.format(Date(nextSlot.startMs))}): ${nextSlot.title}",
-                            color = Color(0xFF67E8F9),
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+
+                    // Rewind (-15s), Pause/Resume, and Live TV controls
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                val target = (player.currentPosition - 15_000L).coerceAtLeast(0L)
+                                player.seekTo(target)
+                            }
+                        ) {
+                            Text("⏪ -15s")
+                        }
+                        Button(
+                            onClick = {
+                                if (player.isPlaying) {
+                                    player.pause()
+                                    isPaused = true
+                                } else {
+                                    player.play()
+                                    isPaused = false
+                                }
+                            }
+                        ) {
+                            Text(if (isPaused) "▶ Play" else "⏸ Pause")
+                        }
+                        Button(
+                            onClick = {
+                                if (player.duration != C.TIME_UNSET && player.duration > 0L) {
+                                    player.seekTo(player.duration)
+                                } else {
+                                    player.seekToDefaultPosition()
+                                }
+                                player.play()
+                                isPaused = false
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF15803D))
+                        ) {
+                            Text("● Live TV")
+                        }
                     }
                 }
 
@@ -1467,7 +1316,7 @@ private fun RealTvGuidePane(
                     TvInputField(
                         value = searchQuery,
                         onValueChange = { searchQuery = it },
-                        label = "Search Guide (Video keeps playing)",
+                        label = "Search Guide (Channel stays playing)",
                         imeAction = ImeAction.Search,
                         modifier = Modifier.weight(1f)
                     )
@@ -1480,6 +1329,23 @@ private fun RealTvGuidePane(
             }
         }
 
+        // 7-Day Lookahead Selector Strip (Today + next 6 days)
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+            items(dayOptions) { (offset, label, _) ->
+                val selected = selectedDayOffset == offset
+                Button(
+                    onClick = { selectedDayOffset = offset },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (selected) Color(0xFFD946EF) else Color(0xFF3B1976)
+                    ),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Text(label, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+
+        // Bottom: Categories + 24-Hour Time Slot Schedule Grid
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.weight(1f)) {
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -1529,19 +1395,27 @@ private fun RealTvGuidePane(
                         .background(Color(0xFF1A0B38), RoundedCornerShape(6.dp))
                         .padding(horizontal = 10.dp, vertical = 6.dp)
                 ) {
-                    Text("Channel", color = Color(0xFF67E8F9), fontWeight = FontWeight.Bold, modifier = Modifier.width(200.dp))
-                    Text("Now (${timeFmt.format(Date(nowMs))})", color = Color(0xFF4ADE80), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                    Text("Up Next", color = Color(0xFF67E8F9), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Text("Channel", color = Color(0xFF67E8F9), fontWeight = FontWeight.Bold, modifier = Modifier.width(195.dp))
+                    Text("Slot 1 (24h)", color = Color(0xFF4ADE80), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Text("Slot 2 (24h)", color = Color(0xFF67E8F9), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    Text("Slot 3 (24h)", color = Color(0xFFE2E8F0), fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 }
                 Spacer(modifier = Modifier.height(6.dp))
 
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxSize()) {
                     items(filtered.take(250)) { entry ->
                         var focused by remember { mutableStateOf(false) }
-                        val isWatching = previewChannel.id == entry.id
-                        val slots = epgTimeline[entry.epgId].orEmpty()
-                        val nowSlot = slots.firstOrNull { nowMs in it.startMs..it.stopMs } ?: slots.firstOrNull()
-                        val nextSlot = slots.firstOrNull { it.startMs > (nowSlot?.startMs ?: nowMs) }
+                        val isWatching = currentPreview.id == entry.id
+                        val daySlots = epgTimeline[entry.epgId].orEmpty()
+                            .filter { it.stopMs >= activeDayRange.first && it.startMs <= activeDayRange.second }
+                        val s1 = daySlots.getOrNull(0)
+                        val s2 = daySlots.getOrNull(1)
+                        val s3 = daySlots.getOrNull(2)
+
+                        fun formatSlot(slot: EpgSlot?): String {
+                            if (slot == null) return "—"
+                            return "${time24Fmt.format(Date(slot.startMs))} ${slot.title}"
+                        }
 
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -1550,7 +1424,7 @@ private fun RealTvGuidePane(
                                 .onFocusChanged { state ->
                                     focused = state.isFocused
                                     if (state.isFocused) {
-                                        onActiveChannelChange(entry)
+                                        onTuneChannel(entry)
                                     }
                                 }
                                 .focusable()
@@ -1568,7 +1442,7 @@ private fun RealTvGuidePane(
                                     shape = RoundedCornerShape(8.dp)
                                 )
                                 .clickable {
-                                    onActiveChannelChange(entry)
+                                    onTuneChannel(entry)
                                     onOpenFullScreen(entry)
                                 }
                                 .padding(horizontal = 10.dp, vertical = 9.dp)
@@ -1579,18 +1453,26 @@ private fun RealTvGuidePane(
                                 fontWeight = FontWeight.Bold,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.width(200.dp).padding(end = 8.dp)
+                                modifier = Modifier.width(195.dp).padding(end = 8.dp)
                             )
                             Text(
-                                text = nowSlot?.title ?: "No information",
-                                color = if (nowSlot != null) Color(0xFF4ADE80) else Color(0xFF94A3B8),
+                                text = formatSlot(s1),
+                                color = if (s1 != null) Color(0xFF4ADE80) else Color(0xFF94A3B8),
                                 style = MaterialTheme.typography.bodySmall,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.weight(1f).padding(end = 8.dp)
                             )
                             Text(
-                                text = nextSlot?.let { "${timeFmt.format(Date(it.startMs))} ${it.title}" } ?: "—",
+                                text = formatSlot(s2),
+                                color = Color(0xFF67E8F9),
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f).padding(end = 8.dp)
+                            )
+                            Text(
+                                text = formatSlot(s3),
                                 color = Color(0xFFE2E8F0),
                                 style = MaterialTheme.typography.bodySmall,
                                 maxLines = 1,
@@ -2120,80 +2002,6 @@ private fun CategorizedBrowserPane(
 }
 
 @Composable
-private fun FullScreenPlayerOverlay(
-    entry: MediaEntry,
-    config: IptvConfig,
-    onBackToGuide: () -> Unit
-) {
-    val context = LocalContext.current
-    BackHandler { onBackToGuide() }
-
-    val player = remember(entry.streamUrl, config.bufferSeconds, config.maxHeightPx) {
-        val bufferMs = (config.bufferSeconds * 1000).coerceIn(5000, 50000)
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(bufferMs, bufferMs * 2, 2000, 3000)
-            .build()
-
-        ExoPlayer.Builder(context)
-            .setLoadControl(loadControl)
-            .build()
-            .apply {
-                trackSelectionParameters = trackSelectionParameters
-                    .buildUpon()
-                    .setMaxVideoSize(3840, config.maxHeightPx)
-                    .build()
-                playWhenReady = true
-                setMediaItem(MediaItem.fromUri(Uri.parse(entry.streamUrl)))
-                prepare()
-            }
-    }
-
-    DisposableEffect(player) {
-        onDispose {
-            runCatching {
-                player.stop()
-                player.release()
-            }
-        }
-    }
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-    ) {
-        AndroidView(
-            factory = { ctx ->
-                PlayerView(ctx).apply {
-                    this.player = player
-                    useController = true
-                }
-            },
-            update = { view -> view.player = player },
-            modifier = Modifier.fillMaxSize()
-        )
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(20.dp)
-                .background(Color(0xAA14072B), RoundedCornerShape(10.dp))
-                .padding(horizontal = 14.dp, vertical = 8.dp)
-        ) {
-            Button(onClick = onBackToGuide) {
-                Text("← Back to Guide")
-            }
-            Text(
-                text = "${entry.name} (${entry.category})",
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
-        }
-    }
-}
-
-@Composable
 private fun BrandLogoBadge() {
     val context = LocalContext.current
     val logoResId = remember {
@@ -2335,6 +2143,331 @@ private fun TvInputField(
                 shape = RoundedCornerShape(4.dp)
             )
     )
+}
+
+@Composable
+private fun SetupAndPlaylistsPane(
+    config: IptvConfig,
+    catalog: LoadedCatalog,
+    isLoading: Boolean,
+    statusMessage: String,
+    onSavePlaylist: (PlaylistProfile, makeActive: Boolean) -> Unit,
+    onActivatePlaylist: (PlaylistProfile) -> Unit,
+    onDeletePlaylist: (PlaylistProfile) -> Unit
+) {
+    val initialProfile = config.activePlaylist ?: PlaylistProfile(name = "Unicorn TV Main")
+    var editingId by remember { mutableStateOf(initialProfile.id) }
+    var playlistName by remember { mutableStateOf(initialProfile.name) }
+    var m3uUrl by remember { mutableStateOf(initialProfile.m3uUrl) }
+    var xtreamHost by remember { mutableStateOf(initialProfile.xtreamHost) }
+    var xtreamUser by remember { mutableStateOf(initialProfile.xtreamUser) }
+    var xtreamPass by remember { mutableStateOf(initialProfile.xtreamPass) }
+    var epgUrl by remember { mutableStateOf(initialProfile.epgUrl) }
+    var updateOnStartup by remember { mutableStateOf(initialProfile.updateOnStartup) }
+    var autoDailyUpdate by remember { mutableStateOf(initialProfile.autoDailyUpdate) }
+    var dailyUpdateHour by remember { mutableStateOf(initialProfile.dailyUpdateHour) }
+
+    fun loadIntoEditor(p: PlaylistProfile) {
+        editingId = p.id
+        playlistName = p.name
+        m3uUrl = p.m3uUrl
+        xtreamHost = p.xtreamHost
+        xtreamUser = p.xtreamUser
+        xtreamPass = p.xtreamPass
+        epgUrl = p.epgUrl
+        updateOnStartup = p.updateOnStartup
+        autoDailyUpdate = p.autoDailyUpdate
+        dailyUpdateHour = p.dailyUpdateHour
+    }
+
+    val dateFmt = remember { SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()) }
+
+    Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxSize()) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A0B38)),
+            modifier = Modifier
+                .width(275.dp)
+                .fillMaxHeight()
+        ) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(12.dp)
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "Saved Playlists (${config.playlists.size})",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Button(
+                        onClick = {
+                            loadIntoEditor(
+                                PlaylistProfile(
+                                    name = "Playlist ${config.playlists.size + 1}",
+                                    updateOnStartup = true,
+                                    autoDailyUpdate = true,
+                                    dailyUpdateHour = 4
+                                )
+                            )
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text("+ New")
+                    }
+                }
+
+                if (config.playlists.isEmpty()) {
+                    Text(
+                        text = "No saved playlists yet. Fill out the form on the right and click Save & Load.",
+                        color = Color(0xFFCBD5E1),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                } else {
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        items(config.playlists) { item ->
+                            val isActive = item.id == config.activePlaylistId
+                            val isEditing = item.id == editingId
+                            Card(
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isActive) Color(0xFF3B1976) else Color(0xFF24104A)
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .border(
+                                        width = if (isEditing || isActive) 2.dp else 1.dp,
+                                        color = if (isActive) Color(0xFF4ADE80) else if (isEditing) Color(0xFF38BDF8) else Color(0xFF4C1D95),
+                                        shape = RoundedCornerShape(10.dp)
+                                    )
+                            ) {
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.padding(10.dp)
+                                ) {
+                                    Text(
+                                        text = "${if (isActive) "✓ " else ""}${item.name}",
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    val schedText = buildString {
+                                        if (item.updateOnStartup) append("Startup")
+                                        if (item.autoDailyUpdate) {
+                                            if (isNotEmpty()) append(" + ")
+                                            append("Daily ${"%02d:00".format(item.dailyUpdateHour)}")
+                                        }
+                                        if (isEmpty()) append("Manual update")
+                                    }
+                                    Text(
+                                        text = "Auto: $schedText",
+                                        color = Color(0xFF67E8F9),
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    Text(
+                                        text = if (item.lastUpdatedMs > 0L) {
+                                            "Updated: ${dateFmt.format(Date(item.lastUpdatedMs))}"
+                                        } else {
+                                            "Not synced yet"
+                                        },
+                                        color = Color(0xFFCBD5E1),
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Button(
+                                            enabled = !isLoading,
+                                            onClick = {
+                                                loadIntoEditor(item)
+                                                onActivatePlaylist(item)
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            Text(if (isActive) "Sync" else "Use", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                        Button(
+                                            onClick = { loadIntoEditor(item) },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            Text("Edit", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                        Button(
+                                            onClick = { onDeletePlaylist(item) },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7F1D1D)),
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                        ) {
+                                            Text("Del", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Column(
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState())
+        ) {
+            TvInputField(
+                value = playlistName,
+                onValueChange = { playlistName = it },
+                label = "Playlist Name (e.g., Main IPTV, Sports Backup)",
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            TvInputField(
+                value = m3uUrl,
+                onValueChange = { m3uUrl = it },
+                label = "M3U / M3U8 Playlist URL (Leave blank if using Xtream below)",
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                TvInputField(
+                    value = xtreamHost,
+                    onValueChange = { xtreamHost = it },
+                    label = "Xtream Server URL",
+                    modifier = Modifier.weight(1f)
+                )
+                TvInputField(
+                    value = xtreamUser,
+                    onValueChange = { xtreamUser = it },
+                    label = "Username",
+                    modifier = Modifier.weight(1f)
+                )
+                TvInputField(
+                    value = xtreamPass,
+                    onValueChange = { xtreamPass = it },
+                    label = "Password",
+                    isPassword = true,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            TvInputField(
+                value = epgUrl,
+                onValueChange = { epgUrl = it },
+                label = "EPG (XMLTV) URL",
+                imeAction = ImeAction.Done,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF24104A)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.padding(12.dp)
+                ) {
+                    Text(
+                        text = "Automatic Playlist & EPG Update Schedule",
+                        color = Color(0xFF38BDF8),
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.titleSmall
+                    )
+
+                    Row(
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Update automatically on each app startup", color = Color.White)
+                        Switch(
+                            checked = updateOnStartup,
+                            onCheckedChange = { updateOnStartup = it }
+                        )
+                    }
+
+                    Row(
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Update automatically once every day", color = Color.White)
+                        Switch(
+                            checked = autoDailyUpdate,
+                            onCheckedChange = { autoDailyUpdate = it }
+                        )
+                    }
+
+                    if (autoDailyUpdate) {
+                        Text(
+                            text = "Select Daily Update Time: ${"%02d:00".format(dailyUpdateHour)}",
+                            color = Color(0xFF67E8F9),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            items((0..23).toList()) { hour ->
+                                val selected = dailyUpdateHour == hour
+                                Button(
+                                    onClick = { dailyUpdateHour = hour },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (selected) Color(0xFFD946EF) else Color(0xFF3B1976)
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                ) {
+                                    Text("${"%02d:00".format(hour)}", style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(
+                    enabled = !isLoading,
+                    onClick = {
+                        val existing = config.playlists.firstOrNull { it.id == editingId }
+                        val profile = PlaylistProfile(
+                            id = editingId,
+                            name = playlistName.trim().ifBlank { "My IPTV Playlist" },
+                            m3uUrl = m3uUrl.trim(),
+                            xtreamHost = xtreamHost.trim(),
+                            xtreamUser = xtreamUser.trim(),
+                            xtreamPass = xtreamPass,
+                            epgUrl = epgUrl.trim(),
+                            updateOnStartup = updateOnStartup,
+                            autoDailyUpdate = autoDailyUpdate,
+                            dailyUpdateHour = dailyUpdateHour,
+                            lastUpdatedMs = existing?.lastUpdatedMs ?: 0L
+                        )
+                        onSavePlaylist(profile, true)
+                    }
+                ) {
+                    Text(if (isLoading) "Updating Playlist..." else "Save & Load Playlist")
+                }
+
+                if (statusMessage.isNotBlank()) {
+                    Text(statusMessage, color = Color(0xFF4ADE80), modifier = Modifier.weight(1f))
+                }
+            }
+
+            if (isLoading) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+
+            Text(
+                text = "Loaded Catalog: ${catalog.live.size} Live • ${catalog.movies.size} Movies • ${catalog.series.size} Series • ${catalog.epgTimeline.size} EPG Channels",
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
 }
 
 @Composable
