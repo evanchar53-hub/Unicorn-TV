@@ -344,7 +344,6 @@ private fun httpGetSmallText(urlStr: String, timeoutMs: Int = 20000): String {
     }
 }
 
-// Streams full Xtream JSON arrays without item caps using android.util.JsonReader
 private fun streamXtreamItems(
     urlStr: String,
     catMap: Map<String, String>,
@@ -438,6 +437,7 @@ private fun readJsonArrayItems(
             MediaKind.LIVE -> "Live TV"
             MediaKind.MOVIE -> "Movies"
             MediaKind.SERIES -> "Series"
+            MediaKind.DVR -> "DVR"
         }
         val category = catMap[catId] ?: catNameRaw.ifBlank { defaultCat }
         val finalName = name.ifBlank { "$defaultCat $resolvedId" }
@@ -445,6 +445,7 @@ private fun readJsonArrayItems(
             MediaKind.LIVE -> "$base/live/$user/$pass/$resolvedId.ts"
             MediaKind.MOVIE -> "$base/movie/$user/$pass/$resolvedId.$ext"
             MediaKind.SERIES -> "$base/player_api.php?username=${Uri.encode(user)}&password=${Uri.encode(pass)}&action=get_series_info&series_id=$resolvedId"
+            MediaKind.DVR -> "$base/live/$user/$pass/$resolvedId.ts"
         }
 
         outList.add(
@@ -473,7 +474,6 @@ private fun readScalarAsString(reader: JsonReader): String {
     }
 }
 
-// Streams full M3U playlist line-by-line without item caps
 private fun streamM3uFromUrl(
     m3uUrl: String,
     liveOut: MutableList<MediaEntry>,
@@ -507,7 +507,7 @@ private fun streamM3uFromUrl(
                         else -> MediaKind.LIVE
                     }
                     val target = when (kind) {
-                        MediaKind.LIVE -> liveOut
+                        MediaKind.LIVE, MediaKind.DVR -> liveOut
                         MediaKind.MOVIE -> movieOut
                         MediaKind.SERIES -> seriesOut
                     }
@@ -782,12 +782,10 @@ fun UnicornTvApp() {
     var isLoadingCatalog by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
 
-    // watchingChannel stays set to the channel currently tuned in playback; browsedChannel tracks surfing
     var watchingChannel by remember { mutableStateOf<MediaEntry?>(null) }
     var isFullScreenTv by remember { mutableStateOf(false) }
     var streamError by remember { mutableStateOf<String?>(null) }
 
-    // Active DVR recording state
     var recordingJob by remember { mutableStateOf<Job?>(null) }
     var activeRecordingLabel by remember { mutableStateOf<String?>(null) }
     var recordings by remember { mutableStateOf(listSavedRecordings(context)) }
@@ -1297,12 +1295,10 @@ private fun SevenDayTvGuidePane(
     val time24Fmt = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
     val current24Time = time24Fmt.format(Date(nowMs))
 
-    // Anchor on the currently watching channel; browsedChannel tracks what the user highlights while surfing
     val anchorChannel = watchingChannel ?: channels.first()
     var browsedChannel by remember(anchorChannel.id) { mutableStateOf(anchorChannel) }
     var isPaused by remember { mutableStateOf(!player.playWhenReady) }
 
-    // Real 24-hour time window anchors for the 3 schedule columns
     val baseHourMs = remember(nowMs) {
         Calendar.getInstance().apply {
             timeInMillis = nowMs
@@ -1343,7 +1339,6 @@ private fun SevenDayTvGuidePane(
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxSize()) {
-        // Top Row: Active Watching Channel Preview + Pause/Rewind/Live/DVR + Search (keeps playing)
         Row(
             horizontalArrangement = Arrangement.spacedBy(12.dp),
             modifier = Modifier
@@ -1507,7 +1502,6 @@ private fun SevenDayTvGuidePane(
             }
         }
 
-        // 7-Day Lookahead Strip
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
             items(dayOptions) { (offset, label, _) ->
                 val selected = selectedDayOffset == offset
@@ -1523,7 +1517,6 @@ private fun SevenDayTvGuidePane(
             }
         }
 
-        // Bottom: Categories + 24-Hour Clock Guide Rows
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.weight(1f)) {
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
